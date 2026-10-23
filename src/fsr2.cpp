@@ -14,10 +14,13 @@ namespace hf {
 namespace {
 
 // FSR 2.1 compute shaders of the game (2.x), from a [Debug] ProbeUpscaler capture
-enum Pass { kOther, kLuminance, kAccumulate, kRcas, kPassCount };
+enum Pass { kOther, kLuminance, kAccumulate, kAccumulateFinal, kRcas, kPassCount };
 constexpr uint64_t kLuminanceHash = 0x45e7974ee0f43114ull;    // compute luminance pyramid: reads the input colour
-constexpr uint64_t kAccumulateHash = 0x09caa46ea4ac6fc9ull;   // accumulate: output when sharpening is off
+constexpr uint64_t kAccumulateHash = 0x09caa46ea4ac6fc9ull;   // accumulate when sharpening is on (RCAS follows)
+constexpr uint64_t kAccumulateFinalHash = 0x75e26d49f7be43bbull;   // accumulate when sharpening is off: final output
 constexpr uint64_t kRcasHash = 0x623f6b3044f56e94ull;         // RCAS: final output
+// the accumulate pass's UAV table: internal colour (ping-pong), lock status, then (sharpening off) the output
+constexpr UINT kFinalOutputSlot = 2;
 
 constexpr int kMaxPsos = 8;
 std::atomic<void*> g_psos[kPassCount][kMaxPsos];
@@ -198,7 +201,7 @@ void Resolve(ID3D12GraphicsCommandList* cl, const Bindings& b) {
             (unsigned long long)d.Width, d.Height, d.Format);
     }
     // without a known accumulate pass nothing would clear the hair targets after the resolve
-    if (!HavePass(kAccumulate)) {
+    if (!HavePass(kAccumulate) && !HavePass(kAccumulateFinal)) {
         LogOnce("fsr2: accumulate pass unknown - resolve skipped");
         return;
     }
@@ -249,7 +252,7 @@ void PostWork(ID3D12GraphicsCommandList* cl, ID3D12Resource* output) {
 void Fsr2PsoCreated(void* pso, uint64_t csHash) {
     if (!pso) return;
     int pass = csHash == kLuminanceHash ? kLuminance : csHash == kAccumulateHash ? kAccumulate
-             : csHash == kRcasHash ? kRcas : kOther;
+             : csHash == kAccumulateFinalHash ? kAccumulateFinal : csHash == kRcasHash ? kRcas : kOther;
     // PSO addresses are reused after the game frees pipelines: drop stale entries
     for (int p = kLuminance; p < kPassCount; ++p)
         for (int i = 0; i < kMaxPsos; ++i)
@@ -344,18 +347,36 @@ void Fsr2BeforeDispatch(void* list) {
     t_injecting = false;
 }
 
+// the final output of the accumulate pass without sharpening: kFinalOutputSlot of the table whose first
+// descriptor is a texture UAV (the internal colour; same size and format as the output)
+ID3D12Resource* FinalOutput(const Bindings& b) {
+    for (UINT i = 0; i < kMaxParams; ++i) {
+        if (b.params[i].kind != kTable) continue;
+        DescInfo first, out;
+        if (!DescAt(b.params[i].value, 0, &first) || !first.uav || first.dim != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            continue;
+        if (DescAt(b.params[i].value, kFinalOutputSlot, &out) && out.uav && out.dim == first.dim &&
+            out.w == first.w && out.h == first.h && out.fmt == first.fmt)
+            return static_cast<ID3D12Resource*>(out.res);
+        LogOnce("fsr2: accumulate output not where expected - unsharp mask off");
+        return nullptr;
+    }
+    return nullptr;
+}
+
 void Fsr2AfterDispatch(void* list) {
     if (t_injecting) return;
     Bindings* b = Find(list);
-    if (!b || (b->pass != kAccumulate && b->pass != kRcas)) return;
+    if (!b || (b->pass != kAccumulate && b->pass != kAccumulateFinal && b->pass != kRcas)) return;
     DescInfo info;
-    ID3D12Resource* out = FirstTexture(*b, true, &info);
-    if (b->pass == kAccumulate) {
+    ID3D12Resource* out = b->pass == kAccumulateFinal ? FinalOutput(*b) : FirstTexture(*b, true, &info);
+    if (b->pass == kAccumulate) {   // RCAS follows; without it the post work runs at the next dispatch
         std::lock_guard<std::mutex> lock(g_m);
         g_pendingOutput = out;
         g_pendingList = list;
         return;
     }
+    // RCAS, or accumulate without sharpening: the final output
     if (!Restorable(*b)) {
         LogOnce("fsr2: game bindings not restorable - FSR 2.1 output left alone");
         return;
