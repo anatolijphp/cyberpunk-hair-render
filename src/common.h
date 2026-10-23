@@ -24,7 +24,7 @@ struct Config {
     float usmRadius = 2.5f;
     float usmThreshold = 0.05f;
     int toggleKey = VK_F10;
-    int overlayKey = VK_F9;        // opens the settings overlay
+    int overlayKey = VK_HOME;      // opens the settings overlay
     bool stabilizeDepth = false;   // hand FSR stable hair depth / motion (can reduce flicker)
     int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask
 };

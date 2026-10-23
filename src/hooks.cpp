@@ -608,14 +608,19 @@ BOOL WINAPI H_ClipCursor(const RECT* r) { return o_ClipCursor(OverlayVisible() ?
 
 UINT WINAPI H_GetRawInputData(HRAWINPUT input, UINT cmd, LPVOID data, PUINT size, UINT headerSize) {
     UINT r = o_GetRawInputData(input, cmd, data, size, headerSize);
-    if (OverlayVisible() && cmd == RID_INPUT && data && r != (UINT)-1) {
-        auto* ri = static_cast<RAWINPUT*>(data);
-        if (ri->header.dwType == RIM_TYPEMOUSE) {
-            ri->data.mouse.lLastX = ri->data.mouse.lLastY = 0;
-            ri->data.mouse.usButtonFlags = 0;
-        } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+    if (cmd != RID_INPUT || !data || r == (UINT)-1) return r;
+    auto* ri = static_cast<RAWINPUT*>(data);
+    if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+        // our hotkeys never reach the game (F9 would quickload, for instance); while the overlay is
+        // open no key does
+        USHORT vk = ri->data.keyboard.VKey;
+        if (OverlayVisible() || vk == g_config.overlayKey || vk == g_config.toggleKey) {
             ri->data.keyboard.VKey = 0xFF;   // "no key"
+            ri->data.keyboard.MakeCode = 0;
         }
+    } else if (ri->header.dwType == RIM_TYPEMOUSE && OverlayVisible()) {
+        ri->data.mouse.lLastX = ri->data.mouse.lLastY = 0;
+        ri->data.mouse.usButtonFlags = 0;
     }
     return r;
 }

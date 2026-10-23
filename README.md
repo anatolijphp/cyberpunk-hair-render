@@ -36,9 +36,10 @@ afterwards if you want to keep the mod.
 
 ## Using it
 
-- **F9** opens the settings overlay: toggles, dropdowns and sliders for every setting, applied
+- **Home** opens the settings overlay: toggles, dropdowns and sliders for every setting, applied
   live while you look at the game. **Save** writes `hairfix.ini`, **Reset to defaults** restores
-  the defaults. While it's open the game doesn't receive mouse / keyboard input; F9 or Esc closes it.
+  the defaults. While it's open the game doesn't receive mouse / keyboard input; Home or Esc closes it.
+  The overlay and toggle keys are never passed to the game.
 - **F10** toggles the fix on and off. A small "HAIR FIX ON / OFF" banner shows the state (and is
   shown for a few seconds at startup, so you can see the mod is loaded).
 - Changes to `bin/x64/hairfix.ini` are picked up while the game runs (within half a second), so
@@ -62,7 +63,7 @@ afterwards if you want to keep the mod.
 | `USMRadius` | `2.5` | unsharp mask blur radius, in screen pixels |
 | `USMThreshold` | `0.05` | leave detail smaller than this (relative to brightness) alone |
 | `ToggleKey` | `0x79` | virtual-key code of the toggle key (0x79 = F10) |
-| `OverlayKey` | `0x78` | virtual-key code of the settings overlay key (0x78 = F9) |
+| `OverlayKey` | `0x24` | virtual-key code of the settings overlay key (0x24 = Home) |
 | `[Debug] View` | `0` | 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 unsharp-mask mask |
 | `[Debug] LogFrames` | `false` | log hair draw counts every 1000 frames |
 | `[Debug] DumpShaders` | `false` | dump the game's hair shaders to `bin/x64/hairfix_dump/` |

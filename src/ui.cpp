@@ -1,6 +1,6 @@
 // Settings overlay (Dear ImGui) drawn into the swap chain back buffer at Present.
 //
-// - F9 (OverlayKey) opens / closes it; Esc closes it.
+// - Home (OverlayKey) opens / closes it; Esc closes it.
 // - Window messages are captured by subclassing the game window. While the overlay is open,
 //   mouse / keyboard / raw input is kept from the game (see also the input hooks in hooks.cpp).
 //   ImGui isn't thread-safe, so the window procedure only queues messages and the render thread
@@ -74,10 +74,11 @@ void SetVisible(bool v) {
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     bool keyDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    bool keyUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
     bool firstPress = keyDown && !(lp & (1 << 30));
-    if (firstPress && (int)wp == g_config.overlayKey) {
-        SetVisible(!g_visible);
-        return 0;
+    if ((keyDown || keyUp) && ((int)wp == g_config.overlayKey || (int)wp == g_config.toggleKey)) {
+        if (firstPress && (int)wp == g_config.overlayKey) SetVisible(!g_visible);
+        return 0;   // our hotkeys are never passed to the game (F10 is read with GetAsyncKeyState)
     }
     if (g_visible) {
         if (firstPress && wp == VK_ESCAPE) {
@@ -330,7 +331,7 @@ void DrawSettings() {
         SetStatus("Reloaded hairfix.ini");
     }
     if (GetTickCount64() < g_statusUntil) ImGui::TextUnformatted(g_status);
-    else ImGui::TextDisabled("F9 / Esc: close   F10: fix on/off");
+    else ImGui::TextDisabled("Home / Esc: close   F10: fix on/off");
 
     ImGui::PopItemWidth();
     ImGui::End();

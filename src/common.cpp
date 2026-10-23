@@ -116,7 +116,7 @@ void LoadConfig() {
     c.usmThreshold = strtof(ReadIni(ini, "Hair", "USMThreshold", "0.05").c_str(), nullptr);
     c.stabilizeDepth = ParseBool(ReadIni(ini, "Hair", "StabilizeDepth", "false"), false);
     c.toggleKey = (int)strtol(ReadIni(ini, "Hair", "ToggleKey", "0x79").c_str(), nullptr, 0);
-    c.overlayKey = (int)strtol(ReadIni(ini, "Hair", "OverlayKey", "0x78").c_str(), nullptr, 0);
+    c.overlayKey = (int)strtol(ReadIni(ini, "Hair", "OverlayKey", "0x24").c_str(), nullptr, 0);
     c.debugView = (int)strtol(ReadIni(ini, "Debug", "View", "0").c_str(), nullptr, 0);
     c.dumpShaders = ParseBool(ReadIni(ini, "Debug", "DumpShaders", "false"), false);
     c.logFrames = ParseBool(ReadIni(ini, "Debug", "LogFrames", "false"), false);
