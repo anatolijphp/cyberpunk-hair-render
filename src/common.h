@@ -15,17 +15,17 @@ struct Config {
     std::string coverage = "raw";  // raw | sharpen
     std::string resolve = "strand";  // box | strand
     int resolveMode = 1;           // 0 box, 1 strand (read by the render thread)
-    float strength = 0.5f;
+    float strength = 0.65f;
     float sharpenThreshold = 0.3f;
     float sharpenWidth = 2.0f;
     int coverageMode = 0;          // 0 raw, 1 sharpen (read by the render thread)
     bool usmEnabled = true;        // unsharp mask on hair after the upscale
-    float usmAmount = 1.0f;
-    float usmRadius = 2.5f;
-    float usmThreshold = 0.05f;
+    float usmAmount = 1.15f;
+    float usmRadius = 2.99f;
+    float usmThreshold = 0.01f;
     int toggleKey = VK_F10;
     int overlayKey = VK_HOME;      // opens the settings overlay
-    bool stabilizeDepth = false;   // hand FSR stable hair depth / motion (can reduce flicker)
+    bool stabilizeDepth = true;    // hand FSR stable hair depth / motion (can reduce flicker)
     int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask
     bool probe = false;            // log compute work of a few frames (finding the built-in FSR 2.1)
 };

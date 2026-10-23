@@ -68,14 +68,14 @@ afterwards if you want to keep the mod.
 | `Enabled` | `true` | `false` disables everything; FSR is passed through untouched |
 | `Coverage` | `raw` | `raw`: soft, translucent strands. `sharpen`: crisp strands with anti-aliased edges |
 | `Resolve` | `strand` | `strand`: blend along the hair strands. `box`: plain 5×5 neighbourhood |
-| `Strength` | `0.5` | 0 = keep the most strand detail ... 1 = smoothest |
-| `StabilizeDepth` | `false` | give FSR stable depth / motion vectors on hair; can reduce flicker |
+| `Strength` | `0.65` | 0 = keep the most strand detail ... 1 = smoothest |
+| `StabilizeDepth` | `true` | give FSR stable depth / motion vectors on hair; can reduce flicker |
 | `SharpenThreshold` | `0.3` | `Coverage = sharpen` only; presets 0.2 / 0.3 / 0.4 / 0.5 |
 | `SharpenWidth` | `2.0` | `Coverage = sharpen` only; edge width in pixels, presets 1 / 1.5 / 2 / 3 |
 | `UnsharpMask` | `true` | sharpen hair (and only hair) after the upscale |
-| `USMAmount` | `1.0` | unsharp mask strength |
-| `USMRadius` | `2.5` | unsharp mask blur radius, in screen pixels |
-| `USMThreshold` | `0.05` | leave detail smaller than this (relative to brightness) alone |
+| `USMAmount` | `1.15` | unsharp mask strength |
+| `USMRadius` | `2.99` | unsharp mask blur radius, in screen pixels |
+| `USMThreshold` | `0.01` | leave detail smaller than this (relative to brightness) alone |
 | `ToggleKey` | `0x79` | virtual-key code of the toggle key (0x79 = F10) |
 | `OverlayKey` | `0x24` | virtual-key code of the settings overlay key (0x24 = Home) |
 | `[Debug] View` | `0` | 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 unsharp-mask mask |
