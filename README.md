@@ -23,9 +23,9 @@ stubble on the jaw.
   Native AA):
   - **FSR 3 / FSR 4**: tested on Linux with Proton (proton-cachyos 11, vkd3d-proton, RX 9070) and
     on Windows 11 (RX 9070 XT, Adrenalin 26.10.1, Steam overlay on), game version 2.x.
-  - **FSR 2.1**: experimental, not yet confirmed in game. The game runs FSR 2.1 itself, and the mod
-    recognises its passes by shader, so a game patch that changes them turns the fix off (see
-    Troubleshooting). `StabilizeDepth` has no effect with FSR 2.1.
+  - **FSR 2.1**: tested on Windows 11 (RX 9070 XT, Adrenalin 26.10.1), game version 2.x. The game
+    runs FSR 2.1 itself, and the mod recognises its passes by shader, so a game patch that changes
+    them turns the fix off (see Troubleshooting). `StabilizeDepth` has no effect with FSR 2.1.
 - With TAA, DLSS or XeSS the mod does nothing.
 
 ## Install
