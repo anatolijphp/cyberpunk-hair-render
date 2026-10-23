@@ -40,6 +40,9 @@ void WriteFile(const std::wstring& path, const void* data, size_t size);
 
 bool InstallD3D12Hooks();               // patches the game's D3D12CreateDevice import
 void HookDeviceFromFfx(void* device);   // device handed to the FFX backend (fallback)
+void FfxCreateBegin();                  // swap chains created inside ffxCreateContext are FFX's own
+void FfxCreateEnd();
+void HookFfxSwapChain(void* swapChain); // frame generation swap chain handed to the game
 void OnFrameBoundary();                 // called once per upscaler dispatch
 
 // banner / toggle

@@ -86,6 +86,10 @@ bool HookSlot(void** vt, size_t slot, Fn fn, void* hook) {
         e = &g_vts[i];
         g_numVt.store(i + 1, std::memory_order_release);
     }
+    // Already hooked once: if the slot now holds something else, another hook (Streamline, FFX,
+    // an overlay) was installed over ours and chains to it. Re-hooking would store that hook as
+    // our original and recurse forever.
+    if (e->orig[fn]) return false;
     e->orig[fn] = vt[slot];
     return WritePtr(&vt[slot], hook);
 }
@@ -491,7 +495,6 @@ FARPROC WINAPI H_GetProcAddress(HMODULE module, LPCSTR name) {
     return p;
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // DXGI hooks for the settings overlay: factory -> swap chain creation -> Present / ResizeBuffers
 
@@ -505,29 +508,63 @@ using PFN_CreateSCHwnd = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, 
                                                      IDXGISwapChain1**);
 using PFN_CreateSC = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 
+// "module+offset" of a code / data address, for diagnostics
+std::string Where(const void* p) {
+    HMODULE m = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<const char*>(p), &m) && m) {
+        GetModuleFileNameA(m, name, MAX_PATH);
+        const char* base = strrchr(name, '\\');
+        char buf[MAX_PATH + 32];
+        snprintf(buf, sizeof(buf), "%s+0x%llx", base ? base + 1 : name,
+                 (unsigned long long)(static_cast<const uint8_t*>(p) - reinterpret_cast<uint8_t*>(m)));
+        return buf;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", p);
+    return buf;
+}
+
+// Swap chain calls can nest on one thread (dxgi.dll may forward Present / ResizeBuffers to their
+// "1" variants through the vtable). Only the outermost call does overlay work; otherwise the
+// overlay locks its (non-recursive) mutex twice on the same thread and the game hangs.
+thread_local int t_dxgiDepth = 0;
+
+struct DxgiScope {
+    bool outer;
+    DxgiScope() : outer(t_dxgiDepth++ == 0) {}
+    ~DxgiScope() { --t_dxgiDepth; }
+};
+
 HRESULT STDMETHODCALLTYPE H_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
-    if (!(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
+    DxgiScope scope;
+    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
     return Orig<PFN_Present>(self, kPresent)(self, sync, flags);
 }
 
 HRESULT STDMETHODCALLTYPE H_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-    if (!(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
+    DxgiScope scope;
+    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
     return Orig<PFN_Present1>(self, kPresent1)(self, sync, flags, p);
 }
 
 HRESULT STDMETHODCALLTYPE H_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags) {
-    OverlayBeforeResize();
+    DxgiScope scope;
+    if (scope.outer) OverlayBeforeResize();
     return Orig<PFN_ResizeBuffers>(self, kResizeBuffers)(self, n, w, h, f, flags);
 }
 
 HRESULT STDMETHODCALLTYPE H_ResizeBuffers1(IDXGISwapChain3* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags,
                                            const UINT* masks, IUnknown* const* queues) {
-    OverlayBeforeResize();
+    DxgiScope scope;
+    if (scope.outer) OverlayBeforeResize();
     return Orig<PFN_ResizeBuffers1>(self, kResizeBuffers1)(self, n, w, h, f, flags, masks, queues);
 }
 
-void HookSwapChain(void* swapChain, IUnknown* queue, HWND hwnd) {
+void HookSwapChainImpl(void* swapChain, IUnknown* queue, HWND hwnd) {
     void** vt = VtableOf(swapChain);
+    Log("swap chain %p: hooking vtable %s", swapChain, Where(vt).c_str());
     HookSlot(vt, VSLOT(IDXGISwapChainVtbl, Present), kPresent, (void*)H_Present);
     HookSlot(vt, VSLOT(IDXGISwapChainVtbl, ResizeBuffers), kResizeBuffers, (void*)H_ResizeBuffers);
     IDXGISwapChain1* sc1 = nullptr;
@@ -544,19 +581,31 @@ void HookSwapChain(void* swapChain, IUnknown* queue, HWND hwnd) {
     OverlayAttach(swapChain, queue, hwnd);
 }
 
+// Only the swap chain the game itself talks to is hooked. Swap chains created underneath it (the
+// native one behind a Streamline proxy, the real one inside FSR frame generation) are left alone:
+// overlays such as Steam's inline-hook dxgi.dll's own code and call back through the vtable, so a
+// vtable hook on the native swap chain recurses forever.
+thread_local int t_scCreateDepth = 0;
+thread_local int t_ffxCreateDepth = 0;   // inside ffxCreateContext (see proxy.cpp)
+
 HRESULT STDMETHODCALLTYPE H_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* queue, HWND hwnd,
                                                    const DXGI_SWAP_CHAIN_DESC1* desc,
                                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output,
                                                    IDXGISwapChain1** out) {
+    ++t_scCreateDepth;
     HRESULT hr = Orig<PFN_CreateSCHwnd>(self, kCreateSCHwnd)(self, queue, hwnd, desc, fs, output, out);
-    if (SUCCEEDED(hr) && out && *out) HookSwapChain(*out, queue, hwnd);
+    --t_scCreateDepth;
+    if (SUCCEEDED(hr) && out && *out && !t_scCreateDepth && !t_ffxCreateDepth) HookSwapChainImpl(*out, queue, hwnd);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE H_CreateSwapChain(IDXGIFactory* self, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc,
                                             IDXGISwapChain** out) {
+    ++t_scCreateDepth;
     HRESULT hr = Orig<PFN_CreateSC>(self, kCreateSC)(self, queue, desc, out);
-    if (SUCCEEDED(hr) && out && *out && desc) HookSwapChain(*out, queue, desc->OutputWindow);
+    --t_scCreateDepth;
+    if (SUCCEEDED(hr) && out && *out && desc && !t_scCreateDepth && !t_ffxCreateDepth)
+        HookSwapChainImpl(*out, queue, desc->OutputWindow);
     return hr;
 }
 
@@ -663,6 +712,20 @@ bool InstallD3D12Hooks() {
 
 void HookDeviceFromFfx(void* device) {
     if (device) HookDevice(device, "ffx backend");
+}
+
+void FfxCreateBegin() { ++t_ffxCreateDepth; }
+void FfxCreateEnd() { --t_ffxCreateDepth; }
+
+void HookFfxSwapChain(void* swapChain) {
+    if (!swapChain) return;
+    HWND hwnd = nullptr;
+    IDXGISwapChain1* sc1 = nullptr;
+    if (SUCCEEDED(IUnknown_QueryInterface((IUnknown*)swapChain, IID_IDXGISwapChain1, (void**)&sc1)) && sc1) {
+        IDXGISwapChain1_GetHwnd(sc1, &hwnd);
+        IUnknown_Release((IUnknown*)sc1);
+    }
+    HookSwapChainImpl(swapChain, nullptr, hwnd);
 }
 
 void OnFrameBoundary() {

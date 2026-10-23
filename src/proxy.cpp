@@ -38,6 +38,13 @@ void LoadOriginal() {
 
 const ffxReturnCode_t kErrorRuntime = 0x2;   // FFX_API_RETURN_ERROR_RUNTIME_ERROR
 
+// from ffx_api_framegeneration_dx12.h (not vendored): the swap chain descriptors share this prefix
+const uint64_t kFgSwapChainWrap = 0x30001, kFgSwapChainNew = 0x30005, kFgSwapChainForHwnd = 0x30006;
+struct FgSwapChainDesc {
+    ffxCreateContextDescHeader header;
+    void** swapchain;   // IDXGISwapChain4**: in the game's swap chain, out the frame generation one
+};
+
 }  // namespace
 
 extern "C" {
@@ -54,7 +61,17 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxC
                 hf::HookDeviceFromFfx(hf::g_ffxDevice);
             }
     }
+    if (hf::g_config.enabled) hf::FfxCreateBegin();
     ffxReturnCode_t r = g_createContext(context, desc, memCb);
+    if (hf::g_config.enabled) {
+        hf::FfxCreateEnd();
+        // frame generation swap chain (wrap / new / for-hwnd): all start with IDXGISwapChain4** swapchain
+        for (auto* h = desc; h && r == 0; h = h->pNext)
+            if (h->type == kFgSwapChainWrap || h->type == kFgSwapChainNew || h->type == kFgSwapChainForHwnd) {
+                void** sc = reinterpret_cast<FgSwapChainDesc*>(h)->swapchain;
+                if (sc) hf::HookFfxSwapChain(*sc);
+            }
+    }
     for (auto* h = desc; h; h = h->pNext)
         hf::Log("ffxCreateContext type=0x%llx -> %u ctx=%p", (unsigned long long)h->type, r,
                 context ? *context : nullptr);
