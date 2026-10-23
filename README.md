@@ -9,7 +9,7 @@ It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX 
 
 ## Comparison
 
-Hair from 2560×1440 screenshots, zoomed 2× without smoothing so every screen pixel shows. Without
+Hair from 2560×1440 screenshots (fsr 2.1 performance, fsr 3 ultra performance), zoomed 2× without smoothing so every screen pixel shows. Without
 the fix the hairline is a grainy dither pattern; with it the strands are soft and translucent.
 
 | | Fix off | Fix on |
