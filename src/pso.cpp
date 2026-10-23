@@ -125,6 +125,7 @@ bool FromStream(const D3D12_PIPELINE_STATE_STREAM_DESC* d, PsoInfo& p) {
                 break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: p.vs = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(in); break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: p.ps = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(in); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: p.cs = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(in); break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
                 p.blend0 = reinterpret_cast<const D3D12_BLEND_DESC*>(in)->RenderTarget[0];
                 break;

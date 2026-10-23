@@ -24,7 +24,10 @@
 #include <vector>
 
 #include "common.h"
+#include "descriptors.h"
+#include "fsr2.h"
 #include "hair.h"
+#include "probe.h"
 #include "pso.h"
 
 namespace hf {
@@ -38,6 +41,12 @@ namespace {
 enum Fn {
     kCreateRootSig, kCreateGPSO, kCreateCL, kCreatePSO, kCreateCL1, kCreateLib, kLoadGPipe, kLoadPipe,
     kSetPSO, kDrawIndexed, kDraw, kOMSetRT, kBeginRP, kEndRP,
+    // built-in FSR 2.1: compute PSOs, descriptors, compute bindings
+    kCreateCPSO, kLoadCPipe, kCreateHeap, kCreateSRV, kCreateUAV, kCopyDescs, kCopyDescsSimple,
+    kDispatch, kSetCTable, kBarrier, kSetHeaps, kSetCRootSig, kSetCConst, kSetCConsts, kSetCCbv, kSetCSrv, kSetCUav,
+    kClose,
+    // upscaler probe only
+    kCreateQueue, kExecute,
     kCreateSCHwnd, kCreateSC, kPresent, kPresent1, kResizeBuffers, kResizeBuffers1, kFnCount
 };
 
@@ -213,6 +222,7 @@ void OnPsoCreated(const PsoInfo& p, void* pso, const char* source, const D3D12_G
     LogA8Candidates(p, source);
     HairKind kind = Classify(p);
     if (!pso) return;
+    Fsr2PsoCreated(pso, 0);   // a graphics PSO may reuse a freed FSR pass PSO's address
     // PSO addresses get reused after the game frees pipelines: drop stale hair entries
     if (kind != HairKind::AlphaAccum) {
         RemoveFromSet(g_hairPsos, g_numHair, pso);
@@ -231,6 +241,13 @@ void OnPsoCreated(const PsoInfo& p, void* pso, const char* source, const D3D12_G
     DumpPso(kind, p);
 }
 
+void OnComputePsoCreated(void* pso, const D3D12_SHADER_BYTECODE& cs) {
+    if (!pso || !cs.pShaderBytecode) return;
+    uint64_t h = Hash64(cs.pShaderBytecode, cs.BytecodeLength);
+    Fsr2PsoCreated(pso, h);
+    if (ProbeEnabled()) ProbeComputePso(pso, h);
+}
+
 // ---------------------------------------------------------------------------------------------
 // command list hooks
 
@@ -247,6 +264,8 @@ void STDMETHODCALLTYPE H_SetPipelineState(ID3D12GraphicsCommandList* self, ID3D1
     t_pso = pso;
     int n1 = g_numHair.load(std::memory_order_relaxed), n2 = g_numHairGbuf.load(std::memory_order_relaxed);
     t_listKind = InSet(g_hairPsos, n1, pso) ? 1 : InSet(g_hairGbufPsos, n2, pso) ? 2 : 0;
+    TrackPipelineState(self, pso);
+    if (ProbeCapturing()) ProbeSetPso(self, pso);
     Orig<PFN_SetPSO>(self, kSetPSO)(self, pso);
 }
 
@@ -291,9 +310,97 @@ void STDMETHODCALLTYPE H_EndRenderPass(ID3D12GraphicsCommandList4* self) {
     Orig<PFN_EndRP>(self, kEndRP)(self);
 }
 
+// compute work and bindings, for the built-in FSR 2.1 (fsr2.h) and the probe
+using PFN_Dispatch = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using PFN_SetCTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+using PFN_Barrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+using PFN_SetHeaps = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+using PFN_SetCRootSig = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+using PFN_SetCConst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using PFN_SetCConsts = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
+using PFN_SetCView = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+using PFN_Close = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
+
+void STDMETHODCALLTYPE H_Dispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z) {
+    Fsr2BeforeDispatch(self);
+    ProbeDispatch(self, x, y, z);
+    Orig<PFN_Dispatch>(self, kDispatch)(self, x, y, z);
+    Fsr2AfterDispatch(self);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRootDescriptorTable(ID3D12GraphicsCommandList* self, UINT index,
+                                                        D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    TrackComputeTable(self, index, table);
+    ProbeSetComputeTable(self, index, table);
+    Orig<PFN_SetCTable>(self, kSetCTable)(self, index, table);
+}
+
+void STDMETHODCALLTYPE H_ResourceBarrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    Fsr2OnBarriers(self, n, b);
+    ProbeBarriers(self, n, b);
+    Orig<PFN_Barrier>(self, kBarrier)(self, n, b);
+}
+
+void STDMETHODCALLTYPE H_SetDescriptorHeaps(ID3D12GraphicsCommandList* self, UINT n, ID3D12DescriptorHeap* const* heaps) {
+    TrackDescriptorHeaps(self, n, heaps);
+    Orig<PFN_SetHeaps>(self, kSetHeaps)(self, n, heaps);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRootSignature(ID3D12GraphicsCommandList* self, ID3D12RootSignature* rs) {
+    TrackComputeRootSignature(self, rs);
+    Orig<PFN_SetCRootSig>(self, kSetCRootSig)(self, rs);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList* self, UINT index, UINT value, UINT offset) {
+    TrackComputeConstants(self, index, 1, &value, offset);
+    Orig<PFN_SetCConst>(self, kSetCConst)(self, index, value, offset);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRoot32BitConstants(ID3D12GraphicsCommandList* self, UINT index, UINT n,
+                                                      const void* data, UINT offset) {
+    TrackComputeConstants(self, index, n, data, offset);
+    Orig<PFN_SetCConsts>(self, kSetCConsts)(self, index, n, data, offset);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList* self, UINT index,
+                                                          D3D12_GPU_VIRTUAL_ADDRESS va) {
+    TrackComputeRootView(self, index, 3, va);
+    Orig<PFN_SetCView>(self, kSetCCbv)(self, index, va);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList* self, UINT index,
+                                                          D3D12_GPU_VIRTUAL_ADDRESS va) {
+    TrackComputeRootView(self, index, 4, va);
+    Orig<PFN_SetCView>(self, kSetCSrv)(self, index, va);
+}
+
+void STDMETHODCALLTYPE H_SetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList* self, UINT index,
+                                                           D3D12_GPU_VIRTUAL_ADDRESS va) {
+    TrackComputeRootView(self, index, 5, va);
+    Orig<PFN_SetCView>(self, kSetCUav)(self, index, va);
+}
+
+HRESULT STDMETHODCALLTYPE H_Close(ID3D12GraphicsCommandList* self) {
+    Fsr2BeforeClose(self);
+    return Orig<PFN_Close>(self, kClose)(self);
+}
+
 void HookCommandList(void* list) {
     void** vt = VtableOf(list);
     bool any = false;
+#define HOOK_CL(Method, fn) any |= HookSlot(vt, VSLOT(ID3D12GraphicsCommandListVtbl, Method), fn, (void*)H_##Method)
+    HOOK_CL(Dispatch, kDispatch);
+    HOOK_CL(SetComputeRootDescriptorTable, kSetCTable);
+    HOOK_CL(ResourceBarrier, kBarrier);
+    HOOK_CL(SetDescriptorHeaps, kSetHeaps);
+    HOOK_CL(SetComputeRootSignature, kSetCRootSig);
+    HOOK_CL(SetComputeRoot32BitConstant, kSetCConst);
+    HOOK_CL(SetComputeRoot32BitConstants, kSetCConsts);
+    HOOK_CL(SetComputeRootConstantBufferView, kSetCCbv);
+    HOOK_CL(SetComputeRootShaderResourceView, kSetCSrv);
+    HOOK_CL(SetComputeRootUnorderedAccessView, kSetCUav);
+    HOOK_CL(Close, kClose);
+#undef HOOK_CL
     any |= HookSlot(vt, VSLOT(ID3D12GraphicsCommandListVtbl, SetPipelineState), kSetPSO, (void*)H_SetPipelineState);
     any |= HookSlot(vt, VSLOT(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced), kDrawIndexed,
                     (void*)H_DrawIndexedInstanced);
@@ -343,23 +450,131 @@ HRESULT STDMETHODCALLTYPE H_CreatePipelineState(ID3D12Device2* self, const D3D12
                                                 REFIID riid, void** out) {
     HRESULT hr = Orig<PFN_CreatePSO>(self, kCreatePSO)(self, d, riid, out);
     PsoInfo p;
-    if (SUCCEEDED(hr) && d && out && FromStream(d, p) && p.ps.pShaderBytecode) OnPsoCreated(p, *out, "create", nullptr, d);
+    if (SUCCEEDED(hr) && d && out && FromStream(d, p)) {
+        if (p.ps.pShaderBytecode) OnPsoCreated(p, *out, "create", nullptr, d);
+        if (p.cs.pShaderBytecode) OnComputePsoCreated(*out, p.cs);
+    }
     return hr;
+}
+
+// command lists the hooks care about: direct ones, and compute ones too while probing
+void OnCommandListCreated(void* list, D3D12_COMMAND_LIST_TYPE type) {
+    if (type == D3D12_COMMAND_LIST_TYPE_DIRECT || (ProbeEnabled() && type == D3D12_COMMAND_LIST_TYPE_COMPUTE)) {
+        HookCommandList(list);
+        if (ProbeEnabled()) ProbeListCreated(list, type);
+    }
 }
 
 HRESULT STDMETHODCALLTYPE H_CreateCommandList(ID3D12Device* self, UINT mask, D3D12_COMMAND_LIST_TYPE type,
                                               ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso, REFIID riid,
                                               void** out) {
     HRESULT hr = Orig<PFN_CreateCL>(self, kCreateCL)(self, mask, type, alloc, pso, riid, out);
-    if (SUCCEEDED(hr) && out && *out && type == D3D12_COMMAND_LIST_TYPE_DIRECT) HookCommandList(*out);
+    if (SUCCEEDED(hr) && out && *out) OnCommandListCreated(*out, type);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE H_CreateCommandList1(ID3D12Device4* self, UINT mask, D3D12_COMMAND_LIST_TYPE type,
                                                D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** out) {
     HRESULT hr = Orig<PFN_CreateCL1>(self, kCreateCL1)(self, mask, type, flags, riid, out);
-    if (SUCCEEDED(hr) && out && *out && type == D3D12_COMMAND_LIST_TYPE_DIRECT) HookCommandList(*out);
+    if (SUCCEEDED(hr) && out && *out) OnCommandListCreated(*out, type);
     return hr;
+}
+
+// ---------------------------------------------------------------------------------------------
+// compute PSOs and descriptors (built-in FSR 2.1, see fsr2.h); queue submissions (probe only)
+
+using PFN_CreateCPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+using PFN_LoadCPipe = HRESULT(STDMETHODCALLTYPE*)(ID3D12PipelineLibrary*, LPCWSTR,
+                                                  const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+using PFN_CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
+using PFN_CreateSRV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_CreateUAV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
+                                               const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_CopyDescs = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT,
+                                               const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+using PFN_CopyDescsSimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+using PFN_CreateQueue = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
+using PFN_Execute = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+
+HRESULT STDMETHODCALLTYPE H_CreateComputePipelineState(ID3D12Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                                                       REFIID riid, void** out) {
+    HRESULT hr = Orig<PFN_CreateCPSO>(self, kCreateCPSO)(self, d, riid, out);
+    if (SUCCEEDED(hr) && d && out && *out) OnComputePsoCreated(*out, d->CS);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE H_LoadComputePipeline(ID3D12PipelineLibrary* self, LPCWSTR name,
+                                                const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** out) {
+    HRESULT hr = Orig<PFN_LoadCPipe>(self, kLoadCPipe)(self, name, d, riid, out);
+    if (SUCCEEDED(hr) && d && out && *out) OnComputePsoCreated(*out, d->CS);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE H_CreateDescriptorHeap(ID3D12Device* self, const D3D12_DESCRIPTOR_HEAP_DESC* d, REFIID riid,
+                                                 void** out) {
+    HRESULT hr = Orig<PFN_CreateHeap>(self, kCreateHeap)(self, d, riid, out);
+    if (SUCCEEDED(hr) && out && *out && IsEqualIID(riid, IID_ID3D12DescriptorHeap)) DescOnHeapCreated(*out);
+    return hr;
+}
+
+void STDMETHODCALLTYPE H_CreateShaderResourceView(ID3D12Device* self, ID3D12Resource* res,
+                                                  const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    Orig<PFN_CreateSRV>(self, kCreateSRV)(self, res, d, dst);
+    DescOnView(res, dst, false, d ? d->Format : DXGI_FORMAT_UNKNOWN);
+}
+
+void STDMETHODCALLTYPE H_CreateUnorderedAccessView(ID3D12Device* self, ID3D12Resource* res, ID3D12Resource* counter,
+                                                   const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    Orig<PFN_CreateUAV>(self, kCreateUAV)(self, res, counter, d, dst);
+    DescOnView(res, dst, true, d ? d->Format : DXGI_FORMAT_UNKNOWN);
+}
+
+void STDMETHODCALLTYPE H_CopyDescriptors(ID3D12Device* self, UINT numDst, const D3D12_CPU_DESCRIPTOR_HANDLE* dst,
+                                         const UINT* dstSizes, UINT numSrc, const D3D12_CPU_DESCRIPTOR_HANDLE* src,
+                                         const UINT* srcSizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    Orig<PFN_CopyDescs>(self, kCopyDescs)(self, numDst, dst, dstSizes, numSrc, src, srcSizes, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) DescOnCopy(numDst, dst, dstSizes, numSrc, src, srcSizes);
+}
+
+void STDMETHODCALLTYPE H_CopyDescriptorsSimple(ID3D12Device* self, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    Orig<PFN_CopyDescsSimple>(self, kCopyDescsSimple)(self, n, dst, src, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) DescOnCopySimple(n, dst, src);
+}
+
+void STDMETHODCALLTYPE H_ExecuteCommandLists(ID3D12CommandQueue* self, UINT n, ID3D12CommandList* const* lists) {
+    ProbeExecute(self, n, reinterpret_cast<void* const*>(lists));
+    Orig<PFN_Execute>(self, kExecute)(self, n, lists);
+}
+
+HRESULT STDMETHODCALLTYPE H_CreateCommandQueue(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* d, REFIID riid,
+                                               void** out) {
+    HRESULT hr = Orig<PFN_CreateQueue>(self, kCreateQueue)(self, d, riid, out);
+    if (SUCCEEDED(hr) && d && out && *out) {
+        Log("probe: command queue %p type=%d", *out, d->Type);
+        HookSlot(VtableOf(*out), VSLOT(ID3D12CommandQueueVtbl, ExecuteCommandLists), kExecute,
+                 (void*)H_ExecuteCommandLists);
+    }
+    return hr;
+}
+
+int HookDeviceCompute(ID3D12Device* dev) {
+    void** vt = VtableOf(dev);
+    int n = 0;
+    if (ProbeEnabled())
+        n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateCommandQueue), kCreateQueue, (void*)H_CreateCommandQueue);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateComputePipelineState), kCreateCPSO,
+                  (void*)H_CreateComputePipelineState);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateDescriptorHeap), kCreateHeap, (void*)H_CreateDescriptorHeap);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateShaderResourceView), kCreateSRV, (void*)H_CreateShaderResourceView);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateUnorderedAccessView), kCreateUAV,
+                  (void*)H_CreateUnorderedAccessView);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CopyDescriptors), kCopyDescs, (void*)H_CopyDescriptors);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CopyDescriptorsSimple), kCopyDescsSimple, (void*)H_CopyDescriptorsSimple);
+    return n;
 }
 
 using PFN_CreateLib = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device1*, const void*, SIZE_T, REFIID, void**);
@@ -380,7 +595,10 @@ HRESULT STDMETHODCALLTYPE H_LoadPipeline(ID3D12PipelineLibrary1* self, LPCWSTR n
                                          const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out) {
     HRESULT hr = Orig<PFN_LoadPipe>(self, kLoadPipe)(self, name, d, riid, out);
     PsoInfo p;
-    if (SUCCEEDED(hr) && d && out && FromStream(d, p) && p.ps.pShaderBytecode) OnPsoCreated(p, *out, "library", nullptr, d);
+    if (SUCCEEDED(hr) && d && out && FromStream(d, p)) {
+        if (p.ps.pShaderBytecode) OnPsoCreated(p, *out, "library", nullptr, d);
+        if (p.cs.pShaderBytecode) OnComputePsoCreated(*out, p.cs);
+    }
     return hr;
 }
 
@@ -393,6 +611,8 @@ HRESULT STDMETHODCALLTYPE H_CreatePipelineLibrary(ID3D12Device1* self, const voi
         if (SUCCEEDED(IUnknown_QueryInterface((IUnknown*)*out, IID_ID3D12PipelineLibrary, (void**)&lib)) && lib) {
             HookSlot(VtableOf(lib), VSLOT(ID3D12PipelineLibraryVtbl, LoadGraphicsPipeline), kLoadGPipe,
                      (void*)H_LoadGraphicsPipeline);
+            HookSlot(VtableOf(lib), VSLOT(ID3D12PipelineLibraryVtbl, LoadComputePipeline), kLoadCPipe,
+                     (void*)H_LoadComputePipeline);
             ID3D12PipelineLibrary_Release(lib);
         }
         ID3D12PipelineLibrary1* lib1 = nullptr;
@@ -417,6 +637,7 @@ void HookDevice(void* device, const char* source) {
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateGraphicsPipelineState), kCreateGPSO,
                   (void*)H_CreateGraphicsPipelineState);
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateCommandList), kCreateCL, (void*)H_CreateCommandList);
+    n += HookDeviceCompute(dev);
 
     ID3D12Device1* dev1 = nullptr;
     if (SUCCEEDED(ID3D12Device_QueryInterface(dev, IID_ID3D12Device1, (void**)&dev1)) && dev1) {
@@ -539,13 +760,19 @@ struct DxgiScope {
 
 HRESULT STDMETHODCALLTYPE H_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
     DxgiScope scope;
-    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
+    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) {
+        ProbePresent();
+        OverlayOnPresent(self);
+    }
     return Orig<PFN_Present>(self, kPresent)(self, sync, flags);
 }
 
 HRESULT STDMETHODCALLTYPE H_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
     DxgiScope scope;
-    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) OverlayOnPresent(self);
+    if (scope.outer && !(flags & DXGI_PRESENT_TEST)) {
+        ProbePresent();
+        OverlayOnPresent(self);
+    }
     return Orig<PFN_Present1>(self, kPresent1)(self, sync, flags, p);
 }
 

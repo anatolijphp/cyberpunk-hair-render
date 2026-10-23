@@ -120,11 +120,12 @@ void LoadConfig() {
     c.debugView = (int)strtol(ReadIni(ini, "Debug", "View", "0").c_str(), nullptr, 0);
     c.dumpShaders = ParseBool(ReadIni(ini, "Debug", "DumpShaders", "false"), false);
     c.logFrames = ParseBool(ReadIni(ini, "Debug", "LogFrames", "false"), false);
+    c.probe = ParseBool(ReadIni(ini, "Debug", "ProbeUpscaler", "false"), false);
     g_config = c;
-    Log("config: enabled=%d coverage=%s resolve=%s strength=%.2f sharpen=%.2f/%.2f key=0x%x dump=%d view=%d stabilize=%d usm=%d (%.2f/%.2f/%.3f)",
+    Log("config: enabled=%d coverage=%s resolve=%s strength=%.2f sharpen=%.2f/%.2f key=0x%x dump=%d view=%d stabilize=%d usm=%d (%.2f/%.2f/%.3f) probe=%d",
         c.enabled, c.coverage.c_str(), c.resolve.c_str(), c.strength, c.sharpenThreshold,
         c.sharpenWidth, c.toggleKey, c.dumpShaders, c.debugView, c.stabilizeDepth, c.usmEnabled, c.usmAmount, c.usmRadius,
-        c.usmThreshold);
+        c.usmThreshold, c.probe);
 }
 
 void Log(const char* fmt, ...) {

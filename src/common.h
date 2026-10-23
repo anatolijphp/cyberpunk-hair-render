@@ -27,6 +27,7 @@ struct Config {
     int overlayKey = VK_HOME;      // opens the settings overlay
     bool stabilizeDepth = false;   // hand FSR stable hair depth / motion (can reduce flicker)
     int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask
+    bool probe = false;            // log compute work of a few frames (finding the built-in FSR 2.1)
 };
 
 extern Config g_config;

@@ -8,7 +8,7 @@ namespace hf {
 enum class HairKind { None, AlphaAccum, BasecolorBlend, GBuffer };
 
 struct PsoInfo {
-    D3D12_SHADER_BYTECODE vs{}, ps{};
+    D3D12_SHADER_BYTECODE vs{}, ps{}, cs{};
     ID3D12RootSignature* rootSig = nullptr;
     UINT numRT = 0;
     DXGI_FORMAT rtv[8]{};

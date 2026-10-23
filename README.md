@@ -10,9 +10,13 @@ It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX 
 ## Requirements
 
 - **FSR selected as the upscaler** in the game's graphics settings (any quality mode, including
-  Native AA). With TAA, DLSS or XeSS the mod does nothing.
-- Tested on Linux with Proton (proton-cachyos 11, vkd3d-proton, RX 9070) and on Windows 11
-  (RX 9070 XT, Adrenalin 26.10.1, Steam overlay on), game version 2.x.
+  Native AA):
+  - **FSR 3 / FSR 4**: tested on Linux with Proton (proton-cachyos 11, vkd3d-proton, RX 9070) and
+    on Windows 11 (RX 9070 XT, Adrenalin 26.10.1, Steam overlay on), game version 2.x.
+  - **FSR 2.1**: experimental, not yet confirmed in game. The game runs FSR 2.1 itself, and the mod
+    recognises its passes by shader, so a game patch that changes them turns the fix off (see
+    Troubleshooting). `StabilizeDepth` has no effect with FSR 2.1.
+- With TAA, DLSS or XeSS the mod does nothing.
 
 ## Install
 
@@ -67,11 +71,15 @@ afterwards if you want to keep the mod.
 | `[Debug] View` | `0` | 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 unsharp-mask mask |
 | `[Debug] LogFrames` | `false` | log hair draw counts every 1000 frames |
 | `[Debug] DumpShaders` | `false` | dump the game's hair shaders to `bin/x64/hairfix_dump/` |
+| `[Debug] ProbeUpscaler` | `false` | log the compute work of a few frames (to find FSR 2.1 after a patch); slow |
 
 ## Troubleshooting
 
 - `bin/x64/hairfix.log` records what the mod found and did. After a game patch, if the hair
   shaders changed, the log says `unknown alpha_accum shader` and the mod leaves hair alone.
+- FSR 2.1: the log says `fsr2: built-in FSR 2.1 found` once the fix is active. If that line never
+  appears, the game's FSR 2.1 shaders changed: set `[Debug] ProbeUpscaler = true`, play for a minute
+  with FSR 2.1 selected and report the log.
 - Crash or black screen: set `Enabled = false`, or uninstall, and report the log.
 
 ## How it works
@@ -88,6 +96,16 @@ decide which pixels a strand covers. The mod:
    samples, weighted by that coverage (optionally along the local strand direction), and hands
    FSR the resolved image.
 3. After FSR, an optional unsharp mask restores strand contrast, masked to hair.
+
+Steps 2 and 3 hook into FSR in one of two ways:
+
+- **FSR 3 / 4** (`src/fsr3.cpp`): the game calls FSR through the FidelityFX API in
+  `amd_fidelityfx_loader_dx12.dll`. The proxy DLL swaps the colour input in the upscale call.
+- **FSR 2.1** (`src/fsr2.cpp`): the game runs FSR 2.1 as its own compute passes, with no DLL call
+  to intercept. The mod recognises those passes by shader hash, finds their input colour and output
+  through the descriptors they bind (`src/descriptors.cpp`) and inserts its work into the game's
+  command list before the first pass and after the last one. The resolved image is copied over the
+  input colour in place. The game's compute bindings are restored after each insertion.
 
 ## Building
 

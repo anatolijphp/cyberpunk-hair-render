@@ -1,9 +1,10 @@
 // Proxy for amd_fidelityfx_loader_dx12.dll: forwards the FFX API to the original
-// (renamed to amd_fidelityfx_loader_dx12_orig.dll) and installs the D3D12 hooks.
+// (renamed to amd_fidelityfx_loader_dx12_orig.dll) and installs the D3D12 hooks. Upscale dispatches
+// (FSR 3 / 4) go through fsr3.cpp; the built-in FSR 2.1 never calls this DLL (fsr2.cpp).
 #include <mutex>
 
 #include "common.h"
-#include "hair.h"
+#include "fsr3.h"
 #include "../third_party/FidelityFX/api/include/ffx_api.h"
 #include "../third_party/FidelityFX/upscalers/include/ffx_upscale.h"
 #include "../third_party/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -99,50 +100,8 @@ __declspec(dllexport) ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDesc
 __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatchDescHeader* desc) {
     LoadOriginal();
     if (!g_loaded) return kErrorRuntime;
-    if (hf::g_config.enabled && desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
-        static int logged = 0;
-        auto* up = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
-        if (logged < 1) {
-            ++logged;
-            hf::Log("upscale: color=%p fmt=%u %ux%u state=%u depth=%p (fmt=%u state=%u) mv=%p (fmt=%u state=%u) out=%p (fmt=%u state=%u) render=%ux%u -> %ux%u",
-                    up->color.resource, up->color.description.format, up->color.description.width,
-                    up->color.description.height, up->color.state, up->depth.resource,
-                    up->depth.description.format, up->depth.state, up->motionVectors.resource,
-                    up->motionVectors.description.format, up->motionVectors.state, up->output.resource, up->output.description.format, up->output.state,
-                    up->renderSize.width,
-                    up->renderSize.height, up->upscaleSize.width, up->upscaleSize.height);
-        }
-        ffxDispatchDescUpscale patched = *up;
-        hf::UpscaleInputs in, out;
-        in.color = up->color.resource;
-        in.colorState = up->color.state;
-        in.depth = up->depth.resource;
-        in.depthState = up->depth.state;
-        in.motion = up->motionVectors.resource;
-        in.motionState = up->motionVectors.state;
-        if (hf::ResolveBeforeUpscale(up->commandList, in, out)) {
-            patched.color.resource = out.color;
-            patched.color.state = FFX_API_RESOURCE_STATE_COMPUTE_READ;
-            if (out.depth) {
-                patched.depth.resource = out.depth;
-                patched.depth.state = FFX_API_RESOURCE_STATE_COMPUTE_READ;
-                patched.depth.description.format = FFX_API_SURFACE_FORMAT_R32_FLOAT;
-            }
-            if (out.motion) {
-                patched.motionVectors.resource = out.motion;
-                patched.motionVectors.state = FFX_API_RESOURCE_STATE_COMPUTE_READ;
-            }
-        }
-        ffxReturnCode_t r = g_dispatch(context, &patched.header);
-        if (r == 0) {
-            hf::ApplyUnsharpMask(up->commandList, up->output.resource, up->output.state, up->renderSize.width,
-                                 up->renderSize.height);
-            hf::AfterUpscale(up->commandList, up->output.resource, up->output.state);
-        }
-        hf::FinishUpscale(up->commandList);
-        hf::OnFrameBoundary();
-        return r;
-    }
+    if (hf::g_config.enabled && desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE)
+        return hf::Fsr3Upscale(g_dispatch, context, reinterpret_cast<const ffxDispatchDescUpscale*>(desc));
     return g_dispatch(context, desc);
 }
 

@@ -9,7 +9,7 @@ python3 tools/gen_shaders.py "$DXC" "$(pwd)"
 "$TC/bin/x86_64-w64-mingw32-clang++" -std=c++17 -O2 -Wall -Wno-unused-function \
     -shared -static -static-libgcc -static-libstdc++ \
     -o build/amd_fidelityfx_loader_dx12.dll \
-    src/proxy.cpp src/hooks.cpp src/pso.cpp src/overlay.cpp src/hair.cpp src/usm.cpp src/ui.cpp src/imgui_build.cpp src/common.cpp \
+    src/proxy.cpp src/fsr3.cpp src/fsr2.cpp src/hooks.cpp src/descriptors.cpp src/probe.cpp src/pso.cpp src/overlay.cpp src/hair.cpp src/usm.cpp src/ui.cpp src/imgui_build.cpp src/common.cpp \
     third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp \
     third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_win32.cpp \
     -Ithird_party/imgui \
