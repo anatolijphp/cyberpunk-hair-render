@@ -11,8 +11,9 @@ It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX 
 
 - **FSR selected as the upscaler** in the game's graphics settings (any quality mode, including
   Native AA). With TAA, DLSS or XeSS the mod does nothing.
-- Tested on Linux with Proton (proton-cachyos 11, vkd3d-proton, RX 9070) and game version 2.x.
-  Windows should work the same way but is untested.
+- Tested on Linux with Proton (proton-cachyos 11, vkd3d-proton, RX 9070) and on Windows 11
+  (RX 9070 XT, Adrenalin 26.10.1, Steam overlay on), game version 2.x, with and without FSR
+  frame generation.
 
 ## Install
 
