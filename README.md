@@ -7,6 +7,16 @@ before FSR runs, and optionally sharpens the hair afterwards.
 
 It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX loader DLL.
 
+## Comparison
+
+Crops at native screen resolution (2560×1440 output); look at the hairline, the beard and the
+stubble on the jaw.
+
+| | Fix off | Fix on |
+|---|---|---|
+| **FSR 2.1** | ![FSR 2.1, fix off](docs/fsr2-off.png) | ![FSR 2.1, fix on](docs/fsr2-on.png) |
+| **FSR 3** | ![FSR 3, fix off](docs/fsr3-off.png) | ![FSR 3, fix on](docs/fsr3-on.png) |
+
 ## Requirements
 
 - **FSR selected as the upscaler** in the game's graphics settings (any quality mode, including
