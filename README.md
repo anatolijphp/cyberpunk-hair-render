@@ -9,8 +9,8 @@ It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX 
 
 ## Comparison
 
-Crops at native screen resolution (2560×1440 output); look at the hairline, the beard and the
-stubble on the jaw.
+Hair from 2560×1440 screenshots, zoomed 2× without smoothing so every screen pixel shows. Without
+the fix the hairline is a grainy dither pattern; with it the strands are soft and translucent.
 
 | | Fix off | Fix on |
 |---|---|---|
