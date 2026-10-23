@@ -1,0 +1,5 @@
+# build output
+/build/
+/dist/
+# local backups of game files (never commit game files)
+*.bak
