@@ -115,6 +115,7 @@ std::vector<FrameMeta> g_frames;
 UINT BytesPerPixel(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_A8_UNORM: return 1;
+        case DXGI_FORMAT_R16_UNORM: return 2;
         case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: return 8;
         case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_TYPELESS: return 16;
         case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
@@ -200,10 +201,10 @@ void FindBox(const uint8_t* data) {
     const auto& kept = g_fp[kKept];
     int x0 = (int)g_w, y0 = (int)g_h, x1 = -1, y1 = -1;
     for (UINT y = 0; y < g_h; ++y) {
-        const uint8_t* c = data + cov.Offset + (size_t)y * cov.Footprint.RowPitch;
+        const uint16_t* c = reinterpret_cast<const uint16_t*>(data + cov.Offset + (size_t)y * cov.Footprint.RowPitch);
         const uint8_t* k = data + kept.Offset + (size_t)y * kept.Footprint.RowPitch;
         for (UINT x = 0; x < g_w; ++x) {
-            if (c[x] < 250 || k[x] > 0) {
+            if (c[x] < 64250 || k[x] > 0) {
                 x0 = std::min(x0, (int)x), x1 = std::max(x1, (int)x);
                 y0 = std::min(y0, (int)y), y1 = std::max(y1, (int)y);
             }
@@ -340,7 +341,7 @@ bool Start(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, const char* pat
     D3D12_RESOURCE_DESC cd = color->GetDesc();
     g_w = (UINT)cd.Width;
     g_h = cd.Height;
-    const D3D12_RESOURCE_DESC descs[kResolved + 1] = {cd, Texture(g_w, g_h, DXGI_FORMAT_R8_UNORM),
+    const D3D12_RESOURCE_DESC descs[kResolved + 1] = {cd, Texture(g_w, g_h, kCoverageFormat),
                                                       Texture(g_w, g_h, DXGI_FORMAT_R8_UNORM),
                                                       Texture(g_w, g_h, cd.Format)};
     UINT64 offset = 0;

@@ -11,7 +11,7 @@ cbuffer Params : register(b0) {
     uint2 pad;
 };
 
-Texture2D<float> transmittance : register(t1);   // our coverage target (R8): 1 = no hair
+Texture2D<float> transmittance : register(t1);   // our coverage target (R16): 1 = no hair
 RWTexture2D<float4> tensorOut : register(u0);
 
 static const int kTile = 16;

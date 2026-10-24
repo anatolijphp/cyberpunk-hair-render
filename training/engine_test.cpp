@@ -3,7 +3,7 @@
 //
 // usage: engine_test <dir>   (dir: input.bin, hairfix_resolve.bin; writes output.bin)
 // input.bin: u32 width, u32 height, u32 raw (must be 1), RGBA16F colour (linear, the mod's resolve),
-//            RGBA16F raw frame, R8 coverage, R8 kept (all width x height)
+//            RGBA16F raw frame, R16 coverage, R8 kept (all width x height)
 // output.bin: RGBA16F colour after the network
 #include <d3d12.h>
 
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
     fread(&w, 4, 1, f);
     fread(&h, 4, 1, f);
     fread(&hasRaw, 4, 1, f);
-    std::vector<uint8_t> color(w * h * 8), rawColor(hasRaw ? w * h * 8 : 0), cov(w * h), kept(w * h);
+    std::vector<uint8_t> color(w * h * 8), rawColor(hasRaw ? w * h * 8 : 0), cov(w * h * 2), kept(w * h);
     fread(color.data(), 1, color.size(), f);
     fread(rawColor.data(), 1, rawColor.size(), f);
     fread(cov.data(), 1, cov.size(), f);
@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
 
     ID3D12Resource* out = Make(Tex(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12Resource* covTex = Make(Tex(w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE), D3D12_HEAP_TYPE_DEFAULT,
+    ID3D12Resource* covTex = Make(Tex(w, h, DXGI_FORMAT_R16_UNORM, D3D12_RESOURCE_FLAG_NONE), D3D12_HEAP_TYPE_DEFAULT,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
     ID3D12Resource* keptTex = Make(Tex(w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE), D3D12_HEAP_TYPE_DEFAULT,
                                    D3D12_RESOURCE_STATE_COPY_DEST);
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     // upload the three textures
     ID3D12Resource* textures[4] = {out, covTex, keptTex, rawTex};
     const uint8_t* data[4] = {color.data(), cov.data(), kept.data(), rawColor.data()};
-    const UINT bpp[4] = {8, 1, 1, 8};
+    const UINT bpp[4] = {8, 2, 1, 8};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[4];
     UINT64 offset = 0;
     for (int t = 0; t < 4; ++t) {

@@ -1,7 +1,7 @@
 // Side coverage pass for the game's hair alpha_accum draws (re-issued with the game's VS and
 // root signature). Re-implements the four game variants without the stochastic dither and
 // without the K-buffer writes:
-//   SV_Target0.a  coverage, blended dst * (1 - a) into an R8 target -> transmittance
+//   SV_Target0.a  coverage, blended dst * (1 - a) into an R16 target -> transmittance
 //   SV_Target1.r  1 where the game's own dither keeps the fragment (blend MAX) -> hair-surface mask
 //
 // Variants (game PS hash): base 23568b87da57f655, DISSOLVE ad72537bdaf26928,

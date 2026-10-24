@@ -27,10 +27,11 @@ def main():
     export.main()
     net.eval()
     s.exposure = info["exposure"]
-    # the game's coverage / kept targets are 8-bit
+    # the mod's coverage target is 16-bit, the kept target 8-bit
     q8 = lambda a: np.round(np.clip(a.astype(np.float32), 0, 1) * 255).astype(np.uint8)
-    cov8, kept8 = q8(s.cov[0]), q8(s.kept[0])
-    s.cov = (cov8[None] / 255.0).astype(np.float16)
+    q16 = lambda a: np.round(np.clip(a.astype(np.float32), 0, 1) * 65535).astype(np.uint16)
+    cov16, kept8 = q16(s.cov[0]), q8(s.kept[0])
+    s.cov = (cov16[None] / 65535.0).astype(np.float16)
     s.kept = (kept8[None] / 255.0).astype(np.float16)
     s.mask = np.stack([train.hair_mask(s.cov[0], s.kept[0])]).astype(np.float16)
     h, w = s.target.shape[:2]
@@ -39,7 +40,7 @@ def main():
         f.write(np.array([w, h, 1], np.uint32).tobytes())
         f.write(rgba(s.frames[0]).tobytes())
         f.write(rgba(s.extra[0]).tobytes())
-        f.write(cov8.tobytes())
+        f.write(cov16.tobytes())
         f.write(kept8.tobytes())
     r = subprocess.run([exe, work], capture_output=True, text=True)
     print(r.stdout.strip())

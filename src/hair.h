@@ -7,6 +7,10 @@
 
 namespace hf {
 
+// The coverage target: hair layers multiply into it one by one, and an 8-bit target would round
+// each layer's (1 - a) back to 1 when a < 1/510, so thin hair would vanish from the coverage.
+constexpr DXGI_FORMAT kCoverageFormat = DXGI_FORMAT_R16_UNORM;
+
 // A game alpha_accum PSO was created; builds the matching side PSO (desc or stream, one non-null).
 void RegisterAlphaAccumPso(void* gamePso, uint64_t psHash, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                            const D3D12_PIPELINE_STATE_STREAM_DESC* stream);

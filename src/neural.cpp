@@ -403,8 +403,8 @@ private:
         UINT base = (UINT)steps_.size() + (ring_++ % kRing) * kFrameSets;
         const UINT setBox = base, setPrep = base + 1, setApply = base + 2;
         for (UINT s : {setBox, setPrep, setApply}) {
-            TextureSrv(s, 0, s == setBox ? cov : copy, s == setBox ? DXGI_FORMAT_R8_UNORM : fmt);
-            TextureSrv(s, 1, s == setBox ? kept : cov, DXGI_FORMAT_R8_UNORM);
+            TextureSrv(s, 0, s == setBox ? cov : copy, s == setBox ? kCoverageFormat : fmt);
+            TextureSrv(s, 1, s == setBox ? kept : cov, s == setBox ? DXGI_FORMAT_R8_UNORM : kCoverageFormat);
             TextureSrv(s, 2, s == setBox ? nullptr : kept, DXGI_FORMAT_R8_UNORM);
             for (UINT u = 0; u < 3; ++u) BufferUav(s, u, nullptr, g_bufFormat, 1);
             BufferUav(s, 3, box_, DXGI_FORMAT_R32_UINT, 4);

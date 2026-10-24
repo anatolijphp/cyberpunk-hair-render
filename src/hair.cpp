@@ -93,7 +93,7 @@ void MakeSideDesc(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const CoverageShader& v
     d.PS = {v.bytes, (SIZE_T)v.size};
     d.NumRenderTargets = 2;
     for (auto& f : d.RTVFormats) f = DXGI_FORMAT_UNKNOWN;
-    d.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+    d.RTVFormats[0] = kCoverageFormat;
     d.RTVFormats[1] = DXGI_FORMAT_R8_UNORM;
     d.BlendState = {};
     d.BlendState.IndependentBlendEnable = TRUE;
@@ -130,7 +130,7 @@ thread_local bool t_inPass = false;
 struct Targets {
     UINT w = 0, h = 0;
     DXGI_FORMAT colorFormat = DXGI_FORMAT_UNKNOWN;
-    ID3D12Resource* cov = nullptr;      // R8 transmittance (RT, cleared to 1)
+    ID3D12Resource* cov = nullptr;      // R16 transmittance (RT, cleared to 1)
     ID3D12Resource* kept = nullptr;     // R8 hair-surface mask (RT, cleared to 0)
     ID3D12Resource* tensor = nullptr;   // RGBA16F strand direction / coherence (UAV)
     ID3D12Resource* output = nullptr;   // resolved colour handed to FSR
@@ -210,8 +210,8 @@ Targets* CurrentTargets() {
     t->h = h;
     t->colorFormat = (DXGI_FORMAT)g_colorFormat.load();
     t->motionFormat = (DXGI_FORMAT)g_motionFormat.load();
-    D3D12_CLEAR_VALUE one{DXGI_FORMAT_R8_UNORM, {{1, 1, 1, 1}}}, zero{DXGI_FORMAT_R8_UNORM, {{0, 0, 0, 0}}};
-    t->cov = MakeTexture(w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_CLEAR_VALUE one{kCoverageFormat, {{1, 1, 1, 1}}}, zero{DXGI_FORMAT_R8_UNORM, {{0, 0, 0, 0}}};
+    t->cov = MakeTexture(w, h, kCoverageFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_RENDER_TARGET, &one);
     t->kept = MakeTexture(w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                           D3D12_RESOURCE_STATE_RENDER_TARGET, &zero);
@@ -567,7 +567,7 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
         g_device->CreateUnorderedAccessView(r, nullptr, &u, at(i));
     };
     srv(color, TypedFormat(cd.Format), 0);
-    srv(t->cov, DXGI_FORMAT_R8_UNORM, 1);
+    srv(t->cov, kCoverageFormat, 1);
     srv(t->kept, DXGI_FORMAT_R8_UNORM, 2);
     srv(t->tensor, DXGI_FORMAT_R16G16B16A16_FLOAT, 3);
     srv(stabilize ? depth : nullptr, stabilize ? depthFmt : DXGI_FORMAT_R32_FLOAT, 4);

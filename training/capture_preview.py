@@ -51,6 +51,8 @@ def load(d, meta, index, name):
     raw = np.fromfile(path, dtype=np.uint8)
     if bpp == 1:
         return raw.reshape(h, w).astype(np.float32) / 255.0
+    if bpp == 2:   # R16_UNORM coverage
+        return raw.view(np.uint16).reshape(h, w).astype(np.float32) / 65535.0
     if fmt in FLOAT_FORMATS:
         return raw.view(FLOAT_FORMATS[fmt]).reshape(h, w, -1)[..., :3].astype(np.float32)
     raise SystemExit("unsupported format %d for %s" % (fmt, name))

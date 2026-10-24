@@ -146,7 +146,7 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
     s.Format = fmt;
     g_device->CreateShaderResourceView(copy, &s, cpu);
     cpu.ptr += g_inc;
-    s.Format = DXGI_FORMAT_R8_UNORM;
+    s.Format = kCoverageFormat;
     g_device->CreateShaderResourceView(cov, &s, cpu);
     cpu.ptr += g_inc;
     void* areaRes = nullptr;
