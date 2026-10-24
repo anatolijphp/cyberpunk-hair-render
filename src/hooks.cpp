@@ -44,6 +44,7 @@ enum Fn {
     kSetPSO, kDrawIndexed, kDraw, kOMSetRT, kBeginRP, kEndRP,
     // built-in FSR 2.1: compute PSOs, descriptors, compute bindings
     kCreateCPSO, kLoadCPipe, kCreateHeap, kCreateSRV, kCreateUAV, kCopyDescs, kCopyDescsSimple,
+    kCreateDSV,   // mirrors: the size of the depth buffer a hair draw uses tells its view
     kDispatch, kSetCTable, kBarrier, kSetHeaps, kSetCRootSig, kSetCConst, kSetCConsts, kSetCCbv, kSetCSrv, kSetCUav,
     kClose,
     // upscaler probe only
@@ -488,6 +489,8 @@ using PFN_CreateCPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CO
 using PFN_LoadCPipe = HRESULT(STDMETHODCALLTYPE*)(ID3D12PipelineLibrary*, LPCWSTR,
                                                   const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 using PFN_CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
+using PFN_CreateDSV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE);
 using PFN_CreateSRV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
                                                D3D12_CPU_DESCRIPTOR_HANDLE);
 using PFN_CreateUAV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
@@ -533,6 +536,12 @@ void STDMETHODCALLTYPE H_CreateUnorderedAccessView(ID3D12Device* self, ID3D12Res
     DescOnView(res, dst, true, d ? d->Format : DXGI_FORMAT_UNKNOWN);
 }
 
+void STDMETHODCALLTYPE H_CreateDepthStencilView(ID3D12Device* self, ID3D12Resource* res,
+                                                 const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    Orig<PFN_CreateDSV>(self, kCreateDSV)(self, res, d, dst);
+    HairOnDepthView(res, dst);
+}
+
 void STDMETHODCALLTYPE H_CopyDescriptors(ID3D12Device* self, UINT numDst, const D3D12_CPU_DESCRIPTOR_HANDLE* dst,
                                          const UINT* dstSizes, UINT numSrc, const D3D12_CPU_DESCRIPTOR_HANDLE* src,
                                          const UINT* srcSizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -575,6 +584,7 @@ int HookDeviceCompute(ID3D12Device* dev) {
                   (void*)H_CreateUnorderedAccessView);
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CopyDescriptors), kCopyDescs, (void*)H_CopyDescriptors);
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CopyDescriptorsSimple), kCopyDescsSimple, (void*)H_CopyDescriptorsSimple);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateDepthStencilView), kCreateDSV, (void*)H_CreateDepthStencilView);
     return n;
 }
 

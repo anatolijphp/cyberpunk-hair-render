@@ -4,6 +4,9 @@
 // - before the first pass (luminance pyramid): resolve the hair, copy the result over the input colour
 // - after the last pass (RCAS, or accumulate when FSR sharpening is off): unsharp mask, banner
 // The game's compute bindings are tracked so they can be restored after each insertion.
+//
+// Mirrors (with any upscaler, hair.h): the same insertion before the mirror view's final compute pass,
+// found by its bindings while the mirror's hair is drawn: the hair resolve goes into its input.
 #pragma once
 
 #include <d3d12.h>
@@ -13,6 +16,7 @@
 namespace hf {
 
 void Fsr2PsoCreated(void* pso, uint64_t csHash);   // every PSO (0 = graphics): classifies / forgets
+void MirrorPassStats(char* buf, size_t size);      // counters since the last call, for the perf log
 
 // compute binding tracking (vtable hooks, recording thread)
 void TrackDescriptorHeaps(void* list, UINT n, ID3D12DescriptorHeap* const* heaps);

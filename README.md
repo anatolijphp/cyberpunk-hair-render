@@ -5,6 +5,8 @@ supposed to smooth out over time. At low render resolutions, and with FSR in gen
 visible as grain. This mod replaces the dither with properly blended, translucent hair right
 before FSR runs, and optionally sharpens the hair afterwards. An optional small neural network
 (`Resolve = neural`) refines the blended hair from the game's raw frame for more strand detail.
+Hair in mirrors, which the game renders as a view of its own without FSR or temporal AA (so the dither
+there is raw grain), gets the same treatment, with settings of its own.
 
 It doesn't modify any game data. It's a drop-in proxy for the game's FidelityFX loader DLL.
 
@@ -80,6 +82,7 @@ afterwards if you want to keep the mod.
 | `USMAmount` | `1.15` | unsharp mask strength |
 | `USMRadius` | `2.99` | unsharp mask blur radius, in screen pixels |
 | `USMThreshold` | `0.01` | leave detail smaller than this (relative to brightness) alone |
+| `Mirror` | `true` | also fix hair in mirrors, with the `[Mirror]` settings below |
 | `ToggleKey` | `0x79` | virtual-key code of the toggle key (0x79 = F10) |
 | `OverlayKey` | `0x24` | virtual-key code of the settings overlay key (0x24 = Home) |
 | `[Debug] View` | `0` | 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 unsharp-mask mask, 5 network mask, 6 network correction (grey = none), 7 mod area (red = hair outside it) |
@@ -87,6 +90,20 @@ afterwards if you want to keep the mod.
 | `[Debug] DumpShaders` | `false` | dump the game's hair shaders to `bin/x64/hairfix_dump/` |
 | `[Debug] ProbeUpscaler` | `false` | log the compute work of a few frames (to find FSR 2.1 after a patch); slow |
 | `[Debug] CaptureKey` | `0` | key that records training data (see `training/README.md`); 0 = off, `0x77` = F8 |
+
+`[Mirror]`: the same settings for hair in mirrors. A mirror is rendered at its own resolution
+(scaled to how much of the screen it covers) and stretched onto the mirror surface, without FSR, so
+its sharpening works in the mirror's own pixels.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Resolve` | `strand` | `box`, `strand` or `neural`, as above |
+| `Strength` | `0.65` | as above |
+| `Area` / `AreaFeather` | `0` / `12.6` | as above, in mirror pixels |
+| `UnsharpMask` | `true` | sharpen the mirror's hair after the resolve |
+| `USMAmount` | `1.65` | unsharp mask strength |
+| `USMRadius` | `2.52` | blur radius, in mirror pixels |
+| `USMThreshold` | `0` | leave detail smaller than this (relative to brightness) alone |
 
 ## Neural resolve (`Resolve = neural`)
 
@@ -99,6 +116,9 @@ gets sharper, more strand-like hair to work with. It changes hair pixels only.
 - Cost on an RX 9070 XT: about 0.5–2 ms per frame, depending on how much of the screen is hair.
   It uses 16-bit maths where the GPU supports it (shader model 6.4) and needs ~140 MB of GPU memory.
 - Without `hairfix_resolve.bin` next to the mod it falls back to the strand resolve.
+- `[Mirror] Resolve = neural` runs the same network on mirrors, with buffers of its own (another
+  ~140 MB while a mirror is in view). It was trained on the main view's frames, which go through
+  FSR; mirrors don't.
 - The shipped model was trained on a single character at FSR 3 Ultra Performance (853×480 →
   2560×1440). It works at other qualities and with FSR 2.1, but other hairstyles and resolutions
   weren't in its training data. `training/README.md` explains how to capture your own data and
@@ -115,6 +135,10 @@ gets sharper, more strand-like hair to work with. It changes hair pixels only.
 - FSR 2.1: the log says `fsr2: built-in FSR 2.1 found` once the fix is active. If that line never
   appears, the game's FSR 2.1 shaders changed: set `[Debug] ProbeUpscaler = true`, play for a minute
   with FSR 2.1 selected and report the log.
+- Mirrors: the log says `hair: mirror <size>` once a mirror's hair is resolved, and every 10 seconds
+  a `mirror:` line counts the hair draws per view and the mirror passes resolved or skipped. After a
+  game patch that changes the mirror's final pass, the mod looks for it by its inputs and logs
+  `mirror: final pass found` when it has it again.
 - Crash or black screen: set `Enabled = false`, or uninstall, and report the log.
 
 ## How it works
@@ -147,6 +171,26 @@ Steps 2 and 3 hook into FSR in one of two ways:
   through the descriptors they bind (`src/descriptors.cpp`) and inserts its work into the game's
   command list before the first pass and after the last one. The resolved image is copied over the
   input colour in place. The game's compute bindings are restored after each insertion.
+
+### Mirrors
+
+A mirror is a second view of the scene with its own depth buffer, rendered before the main view at a
+size that follows how much of the screen it covers, without FSR or temporal AA. Its hair goes
+through the same three passes, so the mod's coverage pass sees it too. The mod (`src/hair.cpp`,
+`src/fsr2.cpp`):
+
+- tracks depth-stencil views, so it knows each hair draw's depth buffer. The main view's is learned
+  at the upscale; hair drawn into any other goes to a separate set of coverage targets, so it never
+  reaches the main view's resolve;
+- recognises the mirror view's final compute pass (it turns the mirror's lit colour into the image the
+  mirror shows) by its shader hash, or, after a patch, by its bindings: one RGBA16F texture of the
+  mirror's size read, one written;
+- inserts the resolve (and the network, the area passes and the unsharp mask, with the `[Mirror]`
+  settings) before that pass, the same way as for FSR 2.1, and copies the result over its input.
+
+The mirror's hair and its final pass are recorded on different command lists, in parallel. Nothing
+depends on their recording order: on the GPU the hair is drawn first, then the mirror pass reads it,
+and the coverage targets are cleared after the main view's upscale.
 
 ## Building
 

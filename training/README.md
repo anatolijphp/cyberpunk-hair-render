@@ -46,7 +46,9 @@ read both, so old and new scenes can be trained together.
    - sets the camera composition to preset 3;
    - turns the character through 0°, 45° … 315°;
    - waits 10 s after each turn for the hair to settle;
-   - has the mod record 16 warm-up and 64 recorded frames with the fix on, then the same with it off;
+   - has the mod record 16 warm-up and 64 recorded frames with the fix on, then the same with it off,
+     then game frames only, until every jitter of the first 64 frames was seen in every phase of the
+     game's hair dither (for averaged targets, below; a few seconds);
    - turns the character back.
 
    Every view goes to `bin/x64/hairfix_capture/<date>_<time>_pm<set>_r<rotation>_w<render width>/`.
@@ -81,6 +83,26 @@ This pairs consecutive photo mode sweeps of different render widths by rotation.
 that don't line up (the camera or character moved between the sweeps) and pairs already prepared.
 For each pair it writes `<low capture>.npz`: raw frames, coverage, hair-surface mask, the mod's
 resolve and the per-frame Native AA target, cropped to the hair.
+
+### Experimental: targets without Native AA
+
+The game's hair dither repeats every 5 frames, FSR's jitter every few dozen. Captures from this
+version record every frame's number, and keep recording until each jitter of the training frames was
+seen in all 5 dither phases. Averaging those frames per jitter gives that frame without the dither,
+at the same resolution and jitter, from the low quality sweep alone (no Native AA switch, nothing to
+line up):
+
+```
+python training/prepare.py "<game>/bin/x64/hairfix_capture" D:/hairfix_train/averaged averaged
+```
+
+It prints a self-check per capture: frames of the same jitter and dither phase should be (almost)
+identical, different phases should differ. This target hasn't been compared with the Native AA one
+on real captures yet. To do that on one view captured both ways:
+
+```
+python training/compare_targets.py "<game>/bin/x64/hairfix_capture" <low capture> <Native AA capture> sheet.png
+```
 
 ## 3. Train
 
@@ -136,7 +158,8 @@ network change far larger than the difference, and no change outside the hair.
 | `cet/hairfix_capture/init.lua` | CET script: photo mode sweeps, talks to the mod through files |
 | `capture_preview.py` | reads a capture, preview sheet, still-frame check |
 | `pairs.py` | pairs low / Native AA sweeps, alignment check |
-| `prepare.py` | builds training scenes from the pairs |
+| `prepare.py` | builds training scenes from the pairs (or, `averaged`, from single captures) |
+| `compare_targets.py` | Native AA vs averaged targets on one view |
 | `train.py` | the network, its inputs, the loss and the training loop |
 | `export.py` | writes `hairfix_resolve.bin` (the format is in its docstring) |
 | `engine_test.py`, `engine_test.cpp` | runs the mod's network engine without the game and compares |

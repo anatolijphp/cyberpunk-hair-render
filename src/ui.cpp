@@ -228,6 +228,21 @@ void SaveConfig() {
     putf("Area", c.area);
     putf("AreaFeather", c.areaFeather);
     put("Hair", "StabilizeDepth", c.stabilizeDepth ? "true" : "false");
+    put("Hair", "Mirror", c.mirror ? "true" : "false");
+    const ViewSettings& m = c.mirrorView;
+    const char* mirrorResolve[] = {"box", "strand", "neural"};
+    put("Mirror", "Resolve", mirrorResolve[m.resolveMode >= 0 && m.resolveMode <= 2 ? m.resolveMode : 1]);
+    auto putm = [&](const char* key, float v) {
+        snprintf(b, sizeof(b), "%.3g", v);
+        put("Mirror", key, b);
+    };
+    putm("Strength", m.strength);
+    putm("Area", m.area);
+    putm("AreaFeather", m.areaFeather);
+    put("Mirror", "UnsharpMask", m.usmEnabled ? "true" : "false");
+    putm("USMAmount", m.usmAmount);
+    putm("USMRadius", m.usmRadius);
+    putm("USMThreshold", m.usmThreshold);
     putf("SharpenThreshold", c.sharpenThreshold);
     putf("SharpenWidth", c.sharpenWidth);
     put("Hair", "UnsharpMask", c.usmEnabled ? "true" : "false");
@@ -249,6 +264,8 @@ void ResetToDefaults() {
     c.area = d.area;
     c.areaFeather = d.areaFeather;
     c.stabilizeDepth = d.stabilizeDepth;
+    c.mirror = d.mirror;
+    c.mirrorView = d.mirrorView;
     c.sharpenThreshold = d.sharpenThreshold;
     c.sharpenWidth = d.sharpenWidth;
     c.usmEnabled = d.usmEnabled;
@@ -330,6 +347,25 @@ void DrawSettings() {
     ImGui::SliderFloat("Amount", &c.usmAmount, 0.0f, 3.0f, "%.2f");
     ImGui::SliderFloat("Radius (px)", &c.usmRadius, 0.5f, 4.0f, "%.2f");
     ImGui::SliderFloat("Threshold", &c.usmThreshold, 0.0f, 0.3f, "%.3f");
+    ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Mirrors (their own view, without FSR)");
+    ImGui::Checkbox("Hair in mirrors", &c.mirror);
+    ImGui::BeginDisabled(!c.mirror);
+    ViewSettings& m = c.mirrorView;
+    const char* mirrorResolve[] = {"Box (5x5)", "Strand-aligned", "Strand + network"};
+    ImGui::Combo("Resolve##mirror", &m.resolveMode, mirrorResolve, 3);
+    ImGui::SliderFloat("Strength##mirror", &m.strength, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("Area##mirror", &m.area, 0.0f, kAreaAll, m.area >= kAreaAll ? "all hair" : "%.1f px from edges");
+    ImGui::BeginDisabled(m.area >= kAreaAll);
+    ImGui::SliderFloat("Area transition##mirror", &m.areaFeather, 0.5f, 16.0f, "%.1f px");
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Unsharp mask##mirror", &m.usmEnabled);
+    ImGui::BeginDisabled(!m.usmEnabled);
+    ImGui::SliderFloat("Amount##mirror", &m.usmAmount, 0.0f, 3.0f, "%.2f");
+    ImGui::SliderFloat("Radius (mirror px)##mirror", &m.usmRadius, 0.5f, 4.0f, "%.2f");
+    ImGui::SliderFloat("Threshold##mirror", &m.usmThreshold, 0.0f, 0.3f, "%.3f");
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
 
     ImGui::SeparatorText("Debug");

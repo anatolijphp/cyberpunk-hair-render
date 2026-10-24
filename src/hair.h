@@ -7,6 +7,8 @@
 
 namespace hf {
 
+struct ViewSettings;   // common.h
+
 // The coverage target: hair layers multiply into it one by one, and an 8-bit target would round
 // each layer's (1 - a) back to 1 when a < 1/510, so thin hair would vanish from the coverage.
 constexpr DXGI_FORMAT kCoverageFormat = DXGI_FORMAT_R16_UNORM;
@@ -44,9 +46,26 @@ bool PendingArea(void** area);
 bool PendingTargets(void** coverage, void** kept, void** resolved);
 void FinishUpscale(void* commandList);
 void OnHairFrameBoundary();
+uint64_t HairFrame();   // frames counted by OnHairFrameBoundary
+void NoteMirrorPass();  // the mirror's final pass runs (this frame has a mirror)
+void MirrorStats(char* buf, size_t size);   // counters since the last call, for the perf log
+
+// mirrors (a second view without upscaler; [Hair] Mirror): depth views tell a hair draw's view
+void HairOnDepthView(void* resource, D3D12_CPU_DESCRIPTOR_HANDLE dst);
+// width << 16 | height of the view other than the main one whose hair was drawn last (this or the
+// last frame: a mirror's), else 0
+uint32_t MirrorSize();
+// the resolve of the mirror's hair into a copy of `color` (its lit colour, compute-readable, this
+// frame's mirror hair drawn): the result (NON_PIXEL_SHADER_RESOURCE, at least the colour's size: its
+// top-left part), or null
+void* ResolveMirror(void* commandList, void* color);
 
 // unsharp mask on the upscaler output (usm.cpp)
 void ApplyUnsharpMask(void* commandList, void* output, unsigned ffxOutputState, unsigned renderW, unsigned renderH);
+// ... and on a mirror's resolve: the top-left width x height of `image` (NON_PIXEL_SHADER_RESOURCE,
+// UAV-capable), its hair coverage target and area map (null: all hair)
+void UnsharpMaskMirror(void* commandList, void* image, unsigned width, unsigned height, void* coverage, void* area,
+                       const ViewSettings& settings);
 
 // helpers (overlay.cpp)
 DXGI_FORMAT TypedFormatForView(DXGI_FORMAT f);      // typeless -> typed; sRGB -> UNKNOWN (no UAV)

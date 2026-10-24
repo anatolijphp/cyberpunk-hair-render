@@ -4,8 +4,10 @@
 // - fix on:  game colour before the mod and FSR, hair coverage, hair-surface mask, resolved colour;
 //            FSR output (display resolution, before the unsharp mask) for the last frames
 // - fix off (switched automatically, restored afterwards): game colour; FSR output for the last frames
-// Each half starts with a few unrecorded frames so FSR's history settles. Averaging the frames of a
-// half gives the reference: dither and FSR jitter average out.
+// - then game colour only, until the first half's jitters were each seen in every phase of the game's
+//   hair dither: averaging the frames of one jitter gives that frame without the dither (prepare.py)
+// Each half starts with a few unrecorded frames so FSR's history settles. Every frame's metadata has
+// its upscaler frame number since the start ("game"): the dither phase is that modulo 5.
 #pragma once
 
 namespace hf {

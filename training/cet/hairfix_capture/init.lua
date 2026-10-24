@@ -17,7 +17,7 @@ local ATTR_COMPOSITION = 23      -- photo mode: camera composition preset (sets 
 local COMPOSITION = 3
 local POSE_SETTLE = 10           -- seconds after a rotation before capturing: the hair swings for a while
 local COMPOSE_SETTLE = 1.5       -- seconds after the composition changed (camera only)
-local CAPTURE_TIMEOUT = 60
+local CAPTURE_TIMEOUT = 120      -- seconds; the capture runs until every jitter was seen in every dither phase
 
 local state = "idle"
 local lastPair = nil

@@ -5,9 +5,11 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common.h"
@@ -153,7 +155,7 @@ ID3D12Device* g_device = nullptr;
 Targets* g_targets = nullptr;
 std::vector<std::pair<uint64_t, Targets*>> g_graveyard;   // (frame retired, targets)
 
-std::atomic<uint64_t> g_frameNo{1};   // only used to age retired targets
+std::atomic<uint64_t> g_frameNo{1};   // ages retired targets, tells the mirror's frames apart
 std::atomic<UINT> g_colorW{0}, g_colorH{0};
 std::atomic<int> g_colorFormat{0};
 std::atomic<int> g_motionFormat{0};
@@ -185,11 +187,10 @@ void Release(Targets* t) {
     delete t;
 }
 
-// current targets matching the last known colour size (created / resized on demand)
-Targets* CurrentTargets() {
-    UINT w = g_colorW.load(), h = g_colorH.load();
-    if (!g_device || !w || !h) return nullptr;
-    std::lock_guard<std::mutex> lock(g_resMutex);
+Targets* MakeTargets(UINT w, UINT h, DXGI_FORMAT colorFormat, DXGI_FORMAT motionFormat, const char* label);
+
+// retired targets older than a few frames (g_resMutex held)
+void AgeGraveyard() {
     uint64_t frame = g_frameNo.load();
     for (auto it = g_graveyard.begin(); it != g_graveyard.end();) {
         if (frame > it->first + 16) {
@@ -199,17 +200,111 @@ Targets* CurrentTargets() {
             ++it;
         }
     }
+}
+
+// current targets matching the last known colour size (created / resized on demand)
+Targets* CurrentTargets() {
+    UINT w = g_colorW.load(), h = g_colorH.load();
+    if (!g_device || !w || !h) return nullptr;
+    std::lock_guard<std::mutex> lock(g_resMutex);
+    AgeGraveyard();
     if (g_targets && g_targets->w == w && g_targets->h == h &&
         g_targets->motionFormat == (DXGI_FORMAT)g_motionFormat.load())
         return g_targets;
-    if (g_targets) g_graveyard.push_back({frame, g_targets});
-    g_targets = nullptr;
+    if (g_targets) g_graveyard.push_back({g_frameNo.load(), g_targets});
+    g_targets = MakeTargets(w, h, (DXGI_FORMAT)g_colorFormat.load(), (DXGI_FORMAT)g_motionFormat.load(), "targets");
+    return g_targets;
+}
 
+// ---------------------------------------------------------------------------------------------
+// mirrors: the game renders a mirror as a second view (its own depth buffer, no upscaler, no temporal
+// AA; its size follows how much of the screen it covers, up to the main view's) and draws hair into it
+// with the same passes, on another command list than the mirror's final compute pass (fsr2.cpp), the
+// two recorded in parallel. Hair goes to the main view's targets only for the main view's depth buffer
+// once that is known; any other depth buffer's hair goes to one more set of targets (grow-only, the
+// frame's hair in its top-left part). Everything else follows from the GPU order of a frame: that hair,
+// then the mirror's final pass (which reads it at its colour's size), then the main view's upscale,
+// after which the set is cleared. The main view's depth buffer is learned at the upscale: one of
+// exactly its size that drew hair this frame while no mirror pass ran lately.
+
+struct DsvInfo {
+    ID3D12Resource* res = nullptr;
+    uint32_t size = 0;   // width << 16 | height
+};
+std::mutex g_dsvMutex;
+std::unordered_map<SIZE_T, DsvInfo> g_dsvs;   // DSV descriptor -> its resource
+
+Targets* g_other = nullptr;                     // hair of depth buffers other than the main view's
+struct OtherDraw {                              // which ones drew lately (for learning the main view's)
+    ID3D12Resource* dsv = nullptr;
+    uint32_t size = 0;
+    uint64_t frame = 0;
+};
+constexpr int kOtherDraws = 4;
+OtherDraw g_otherDraws[kOtherDraws];
+std::mutex g_otherMutex;                        // taken before g_resMutex
+std::atomic<ID3D12Resource*> g_mainDsv{nullptr};
+std::atomic<uint64_t> g_mainDrawnFrame{0};      // last frame with hair in the main view's targets
+std::atomic<uint64_t> g_otherDrawnFrame{0};     // ... in the other set
+std::atomic<uint64_t> g_mirrorPassFrame{0};     // last frame the mirror's final pass ran
+std::atomic<uint32_t> g_mirrorSize{0};          // the last mirror pass's colour (log)
+std::atomic<int> g_missed{0};                   // mirror passes in a row without other hair lately
+constexpr DXGI_FORMAT kMirrorColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;   // the mirror's lit colour
+
+// counters for the perf log line (MirrorStats)
+enum Stat { kMainDraws, kViewDraws, kNoDsv, kPasses, kResolved, kSkipSmall, kSkipFormat, kSkipOther, kStats };
+std::atomic<uint32_t> g_stats[kStats];
+
+void ClearTargets(ID3D12GraphicsCommandList* cl, Targets* t);
+
+// the other set, of at least w x h (grow-only, rounded up: a mirror changes size every frame)
+Targets* OtherTargets(const DsvInfo& d) {
+    const UINT w = d.size >> 16, h = d.size & 0xffff;
+    const uint64_t frame = g_frameNo.load();
+    std::lock_guard<std::mutex> lock(g_otherMutex);
+    OtherDraw* slot = nullptr;
+    for (OtherDraw& o : g_otherDraws)
+        if (o.dsv == d.res) slot = &o;
+    if (!slot) {   // the least recent one
+        slot = &g_otherDraws[0];
+        for (OtherDraw& o : g_otherDraws)
+            if (o.frame < slot->frame) slot = &o;
+        slot->dsv = d.res;
+    }
+    slot->size = d.size;
+    slot->frame = frame;
+    g_otherDrawnFrame = frame;
+    std::lock_guard<std::mutex> rl(g_resMutex);
+    Targets* t = g_other;
+    if (t && t->w >= w && t->h >= h) return t;
+    UINT nw = (std::max(w, t ? t->w : 0u) + 63) / 64 * 64, nh = (std::max(h, t ? t->h : 0u) + 63) / 64 * 64;
+    if (t) g_graveyard.push_back({frame, t});
+    g_other = MakeTargets(nw, nh, kMirrorColorFormat, DXGI_FORMAT_UNKNOWN, "other view targets");
+    return g_other;
+}
+
+// at the upscale (w x h): a depth buffer of exactly that size that drew hair this frame, with no
+// mirror lately, is the main view's
+void LearnMainView(UINT w, UINT h) {
+    const uint64_t frame = g_frameNo.load();
+    if (!g_config.mirror || frame <= g_mirrorPassFrame.load() + 2) return;   // a mirror may have the main view's size
+    std::lock_guard<std::mutex> lock(g_otherMutex);
+    for (OtherDraw& o : g_otherDraws)
+        if (o.dsv && o.frame == frame && o.size == (w << 16 | h) && o.dsv != g_mainDsv.load()) {
+            g_mainDsv = o.dsv;
+            Log("hair: main view depth buffer %p (%ux%u)", (void*)o.dsv, w, h);
+            o.dsv = nullptr;
+            o.frame = 0;
+            return;
+        }
+}
+
+Targets* MakeTargets(UINT w, UINT h, DXGI_FORMAT colorFormat, DXGI_FORMAT motionFormat, const char* label) {
     auto* t = new Targets;
     t->w = w;
     t->h = h;
-    t->colorFormat = (DXGI_FORMAT)g_colorFormat.load();
-    t->motionFormat = (DXGI_FORMAT)g_motionFormat.load();
+    t->colorFormat = colorFormat;
+    t->motionFormat = motionFormat;
     D3D12_CLEAR_VALUE one{kCoverageFormat, {{1, 1, 1, 1}}}, zero{DXGI_FORMAT_R8_UNORM, {{0, 0, 0, 0}}};
     t->cov = MakeTexture(w, h, kCoverageFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_RENDER_TARGET, &one);
@@ -236,8 +331,7 @@ Targets* CurrentTargets() {
     t->rtv[1].ptr += inc;
     g_device->CreateRenderTargetView(t->cov, nullptr, t->rtv[0]);
     g_device->CreateRenderTargetView(t->kept, nullptr, t->rtv[1]);
-    Log("hair: targets %ux%u (colour format %d)", w, h, t->colorFormat);
-    g_targets = t;
+    Log("hair: %s %ux%u (colour format %d)", label, w, h, t->colorFormat);
     return t;
 }
 
@@ -294,11 +388,15 @@ ID3D12PipelineState* g_areaRowPso = nullptr;    // [Hair] Area: row distance to 
 ID3D12PipelineState* g_areaPso = nullptr;       // ... distance, and the game's own image outside the area
 ID3D12DescriptorHeap* g_csHeap = nullptr;
 UINT g_csInc = 0;
-UINT g_ring = 0;
+std::atomic<UINT> g_ring{0};   // the main view and a mirror may record resolves at the same time
 bool g_csFailed = false;
+std::atomic<bool> g_csReady{false};
+std::mutex g_csMutex;
 
 bool InitCompute() {
-    if (g_resolvePso) return true;
+    if (g_csReady.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lock(g_csMutex);
+    if (g_csReady.load()) return true;
     if (g_csFailed || !g_device) return false;
     HRESULT hr = g_device->CreateRootSignature(0, kResolveCso, sizeof(kResolveCso), IID_PPV_ARGS(&g_csRootSig));
     D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
@@ -331,6 +429,7 @@ bool InitCompute() {
     }
     g_csInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     Log("hair: compute initialised");
+    g_csReady.store(true, std::memory_order_release);
     return true;
 }
 
@@ -492,11 +591,31 @@ void AfterAlphaAccumDraw(void* list, void* gamePso, bool indexed, UINT a, UINT b
         LogOnce("hair: render targets of the alpha_accum draw unknown - side pass skipped");
         return;
     }
-    Targets* t = CurrentTargets();
-    if (!t) return;
-
+    // the view (see "mirrors" above)
+    DsvInfo dsv;
+    {
+        std::lock_guard<std::mutex> lock(g_dsvMutex);
+        auto it = g_dsvs.find(t_rt.dsv.ptr);
+        if (it != g_dsvs.end()) dsv = it->second;
+    }
+    const uint32_t mainSize = g_colorW.load() << 16 | g_colorH.load();
+    // without mirrors: any depth buffer of the main view's size, as the main view's; others are left out
+    const bool main = !dsv.res || dsv.res == g_mainDsv.load() || (!g_config.mirror && dsv.size == mainSize);
+    if (!main && !g_config.mirror) return;
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
-    if (t->needsInitialClear.exchange(false)) ClearTargets(cl, t);
+    Targets* t;
+    if (main) {
+        g_stats[dsv.res ? kMainDraws : kNoDsv]++;
+        t = CurrentTargets();
+        if (!t) return;
+        if (t->needsInitialClear.exchange(false)) ClearTargets(cl, t);
+        g_mainDrawnFrame = g_frameNo.load();
+    } else {
+        g_stats[kViewDraws]++;
+        t = OtherTargets(dsv);
+        if (!t) return;
+        if (t->needsInitialClear.exchange(false)) ClearTargets(cl, t);   // later: after each upscale
+    }
     RtState saved = t_rt;   // our own OMSetRenderTargets below goes through the tracking hook
     cl->OMSetRenderTargets(2, t->rtv, FALSE, &saved.dsv);
     cl->SetPipelineState(side);
@@ -506,42 +625,12 @@ void AfterAlphaAccumDraw(void* list, void* gamePso, bool indexed, UINT a, UINT b
     cl->OMSetRenderTargets(saved.n, saved.n ? saved.rts : nullptr, saved.single, &saved.dsv);
 }
 
-bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInputs& out) {
-    out = {};
-    auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
-    auto* color = static_cast<ID3D12Resource*>(in.color);
-    auto* depth = static_cast<ID3D12Resource*>(in.depth);
-    auto* motion = static_cast<ID3D12Resource*>(in.motion);
-    if (!cl || !color) return false;
-    D3D12_RESOURCE_DESC cd = color->GetDesc();
-    g_colorW = (UINT)cd.Width;
-    g_colorH = cd.Height;
-    g_colorFormat = (int)TypedFormat(cd.Format);
-    DXGI_FORMAT motionFmt = motion ? TypedFormat(motion->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
-    g_motionFormat = (int)motionFmt;
-
-    if (!IsActive()) return false;
-    if (cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        LogOnce("hair: upscaler runs on a non-graphics command list - resolve skipped");
-        return false;
-    }
-    Targets* t;
-    {
-        std::lock_guard<std::mutex> lock(g_resMutex);
-        t = g_targets;
-    }
-    if (!t || t->w != cd.Width || t->h != cd.Height || t->needsInitialClear.load() || !InitCompute()) return false;
-    constexpr unsigned kComputeRead = 1 << 2;   // FFX_API_RESOURCE_STATE_COMPUTE_READ
-    if (!(in.colorState & kComputeRead)) {
-        LogOnce("hair: colour input not in a compute-read state - resolve skipped");
-        return false;
-    }
-    DXGI_FORMAT depthFmt = depth ? DepthSrvFormat(depth->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
-    bool stabilize = g_config.stabilizeDepth && depthFmt != DXGI_FORMAT_UNKNOWN && t->motionOut &&
-                     motionFmt == t->motionFormat && (in.depthState & kComputeRead) && (in.motionState & kComputeRead);
-    if (g_config.stabilizeDepth && !stabilize)
-        LogOnce("hair: depth / motion inputs not usable - depth stabilisation off");
-
+// The resolve of one view: colour (compute-readable) -> t->output, from the view's hair targets (left
+// readable: NON_PIXEL_SHADER_RESOURCE). Depth / motion only with stabilize; mainView: the main view's
+// network (else the mirror's); vs: the view's resolve settings.
+static void RecordResolve(ID3D12GraphicsCommandList* cl, Targets* t, ID3D12Resource* color, const D3D12_RESOURCE_DESC& cd,
+                   ID3D12Resource* depth, DXGI_FORMAT depthFmt, ID3D12Resource* motion, DXGI_FORMAT motionFmt,
+                   bool stabilize, bool mainView, UINT w, UINT h, const ViewSettings& vs) {
     UINT slot = (g_ring++ % kRing) * kSetSize;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_csHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_csHeap->GetGPUDescriptorHandleForHeapStart();
@@ -589,10 +678,10 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     Flush(cl, bars);
 
     const Config& cfg = g_config;
-    uint32_t mode = cfg.resolveMode == 0 ? 0 : 1;   // box | strand (the network runs on the strand resolve)
-    float strength = cfg.strength;
+    uint32_t mode = vs.resolveMode == 0 ? 0 : 1;   // box | strand (the network runs on the strand resolve)
+    float strength = vs.strength;
     uint32_t view = cfg.debugView <= 3 ? (uint32_t)cfg.debugView : 0;   // 4 is the unsharp-mask view
-    uint32_t consts[8] = {t->w, t->h, mode, 0, view, stabilize ? 1u : 0u, 0, 0};
+    uint32_t consts[8] = {w, h, mode, 0, view, stabilize ? 1u : 0u, 0, 0};
     memcpy(&consts[3], &strength, 4);
 
     cl->SetDescriptorHeaps(1, &g_csHeap);
@@ -601,13 +690,13 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     cl->SetComputeRootDescriptorTable(1, gpu);
     if (mode == 1 || view == 3) {
         cl->SetPipelineState(g_tensorPso);
-        cl->Dispatch((t->w + 15) / 16, (t->h + 15) / 16, 1);
+        cl->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
         Barrier(cl, t->tensor, kUav, kRead, bars);
         Flush(cl, bars);
         t->tensorState = kRead;
     }
     cl->SetPipelineState(g_resolvePso);
-    cl->Dispatch((t->w + 7) / 8, (t->h + 7) / 8, 1);
+    cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
     Barrier(cl, t->output, kUav, kRead, bars);
     Barrier(cl, t->depthOut, kUav, kRead, bars);
@@ -615,19 +704,20 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     Flush(cl, bars);
     t->outputState = kRead;
     t->auxState = kRead;
-    t_pending = t;   // FinishUpscale returns the hair targets to render-target state and clears them
     // the resolve network rewrites the resolve from it and the raw frame (debug views show the resolve)
-    if (cfg.resolveMode == 2 && view == 0)
-        NeuralResolve(cl, t->output, kRead, color, t->cov, t->kept, t->w, t->h);
+    if (vs.resolveMode == 2 && view == 0) {   // each view has its own network buffers
+        if (mainView) NeuralResolve(cl, t->output, kRead, color, t->cov, t->kept, w, h);
+        else NeuralResolveMirror(cl, t->output, kRead, color, t->cov, t->kept, w, h);
+    }
     // [Hair] Area: the mod works only this far from strand edges. Outside, FSR gets the game's own
     // colour back, and the unsharp mask (usm.cpp) skips it: the map stays in .y of the tensor target
     // (no longer needed by now; PendingArea hands it on)
     t->areaValid = false;
-    if ((cfg.area < kAreaAll || cfg.debugView == 7) && view == 0) {
+    if ((vs.area < kAreaAll || cfg.debugView == 7) && view == 0) {
         // width < 0: all hair (only the debug view gets here then)
-        float width = cfg.area < kAreaAll ? std::max(cfg.area, 0.0f) : -1.0f;
-        float feather = std::min(std::max(cfg.areaFeather, 0.5f), 32.0f);
-        uint32_t ac[8] = {t->w, t->h, 0, 0, (uint32_t)cfg.debugView, stabilize ? 1u : 0u, 0, 0};
+        float width = vs.area < kAreaAll ? std::max(vs.area, 0.0f) : -1.0f;
+        float feather = std::min(std::max(vs.areaFeather, 0.5f), 32.0f);
+        uint32_t ac[8] = {w, h, 0, 0, (uint32_t)cfg.debugView, stabilize ? 1u : 0u, 0, 0};
         memcpy(&ac[2], &width, 4);
         memcpy(&ac[3], &feather, 4);
         Barrier(cl, t->tensor, t->tensorState, kUav, bars);
@@ -640,13 +730,13 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
         cl->SetComputeRoot32BitConstants(0, 8, ac, 0);
         cl->SetComputeRootDescriptorTable(1, gpu);
         cl->SetPipelineState(g_areaRowPso);
-        cl->Dispatch((t->w + 7) / 8, (t->h + 7) / 8, 1);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER u{};
         u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         u.UAV.pResource = t->tensor;
         cl->ResourceBarrier(1, &u);
         cl->SetPipelineState(g_areaPso);
-        cl->Dispatch((t->w + 7) / 8, (t->h + 7) / 8, 1);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         Barrier(cl, t->tensor, kUav, kRead, bars);
         Barrier(cl, t->output, kUav, kRead, bars);
         Barrier(cl, t->depthOut, kUav, kRead, bars);
@@ -656,12 +746,59 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
         t->areaValid = true;
     }
 
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        Log("hair: first resolve %ux%u mode=%s strength=%.2f debug=%d stabilise=%d (depth fmt %d, motion fmt %d)",
-            t->w, t->h, mode ? "strand" : "box", strength, cfg.debugView, stabilize, depthFmt, motionFmt);
+    static bool logged[2] = {};
+    if (!logged[mainView ? 0 : 1]) {
+        logged[mainView ? 0 : 1] = true;
+        Log("hair: first resolve (%s) %ux%u mode=%s strength=%.2f debug=%d stabilise=%d (depth fmt %d, motion fmt %d)",
+            mainView ? "main view" : "mirror", w, h, mode ? "strand" : "box", strength, cfg.debugView, stabilize,
+            depthFmt, motionFmt);
     }
+}
+
+bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInputs& out) {
+    out = {};
+    auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    auto* color = static_cast<ID3D12Resource*>(in.color);
+    auto* depth = static_cast<ID3D12Resource*>(in.depth);
+    auto* motion = static_cast<ID3D12Resource*>(in.motion);
+    if (!cl || !color) return false;
+    D3D12_RESOURCE_DESC cd = color->GetDesc();
+    g_colorW = (UINT)cd.Width;
+    g_colorH = cd.Height;
+    g_colorFormat = (int)TypedFormat(cd.Format);
+    LearnMainView((UINT)cd.Width, cd.Height);
+    DXGI_FORMAT motionFmt = motion ? TypedFormat(motion->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+    g_motionFormat = (int)motionFmt;
+
+    if (!IsActive()) return false;
+    if (cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        LogOnce("hair: upscaler runs on a non-graphics command list - resolve skipped");
+        return false;
+    }
+    Targets* t;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        t = g_targets;
+    }
+    if (!t || t->w != cd.Width || t->h != cd.Height || t->needsInitialClear.load() || !InitCompute()) return false;
+    constexpr unsigned kComputeRead = 1 << 2;   // FFX_API_RESOURCE_STATE_COMPUTE_READ
+    if (!(in.colorState & kComputeRead)) {
+        LogOnce("hair: colour input not in a compute-read state - resolve skipped");
+        return false;
+    }
+    DXGI_FORMAT depthFmt = depth ? DepthSrvFormat(depth->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+    bool stabilize = g_config.stabilizeDepth && depthFmt != DXGI_FORMAT_UNKNOWN && t->motionOut &&
+                     motionFmt == t->motionFormat && (in.depthState & kComputeRead) && (in.motionState & kComputeRead);
+    if (g_config.stabilizeDepth && !stabilize)
+        LogOnce("hair: depth / motion inputs not usable - depth stabilisation off");
+
+    ViewSettings main;
+    main.resolveMode = g_config.resolveMode;
+    main.strength = g_config.strength;
+    main.area = g_config.area;
+    main.areaFeather = g_config.areaFeather;
+    RecordResolve(cl, t, color, cd, depth, depthFmt, motion, motionFmt, stabilize, true, t->w, t->h, main);
+    t_pending = t;   // FinishUpscale returns the hair targets to render-target state and clears them
     out.color = t->output;
     if (stabilize) {
         out.depth = t->depthOut;
@@ -695,8 +832,17 @@ bool PendingTargets(void** coverage, void** kept, void** resolved) {
 void FinishUpscale(void* commandList) {
     Targets* t = t_pending;
     t_pending = nullptr;
-    if (!t) return;
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    {
+        // the other views' hair of this frame was read by the mirror pass by now (GPU order)
+        Targets* o;
+        {
+            std::lock_guard<std::mutex> lock(g_resMutex);
+            o = g_other;
+        }
+        if (cl && o && !o->needsInitialClear.load()) ClearTargets(cl, o);
+    }
+    if (!t) return;
     std::vector<D3D12_RESOURCE_BARRIER> bars;
     Barrier(cl, t->cov, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
     Barrier(cl, t->kept, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
@@ -705,5 +851,93 @@ void FinishUpscale(void* commandList) {
 }
 
 void OnHairFrameBoundary() { g_frameNo.fetch_add(1); }
+
+void HairOnDepthView(void* resource, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    std::lock_guard<std::mutex> lock(g_dsvMutex);
+    if (!resource) {
+        g_dsvs.erase(dst.ptr);
+        return;
+    }
+    auto* r = static_cast<ID3D12Resource*>(resource);
+    D3D12_RESOURCE_DESC d = r->GetDesc();
+    g_dsvs[dst.ptr] = {r, (uint32_t)(d.Width & 0xffff) << 16 | (d.Height & 0xffff)};
+}
+
+uint64_t HairFrame() { return g_frameNo.load(); }
+
+void NoteMirrorPass() { g_mirrorPassFrame = g_frameNo.load(); }
+
+void MirrorStats(char* buf, size_t size) {
+    uint32_t s[kStats];
+    for (int i = 0; i < kStats; ++i) s[i] = g_stats[i].exchange(0);
+    const uint32_t m = g_mirrorSize.load();
+    snprintf(buf, size,
+             "hair draws main %u other views %u unknown-depth %u; mirror pass %u: resolved %u, skipped (targets "
+             "smaller %u, format %u, other %u); last mirror %ux%u, main %ux%u, main depth %s",
+             s[kMainDraws], s[kViewDraws], s[kNoDsv], s[kPasses], s[kResolved], s[kSkipSmall], s[kSkipFormat],
+             s[kSkipOther], m >> 16, m & 0xffff, g_colorW.load(), g_colorH.load(), g_mainDsv.load() ? "known" : "unknown");
+}
+
+uint32_t MirrorSize() {
+    if (!g_config.mirror) return 0;
+    const uint64_t frame = g_frameNo.load();
+    std::lock_guard<std::mutex> lock(g_otherMutex);
+    const OtherDraw* best = nullptr;
+    for (const OtherDraw& o : g_otherDraws)
+        if (o.dsv && o.frame + 1 >= frame && (!best || o.frame > best->frame)) best = &o;
+    return best ? best->size : 0;
+}
+
+void* ResolveMirror(void* commandList, void* colorRes) {
+    auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    auto* color = static_cast<ID3D12Resource*>(colorRes);
+    if (!cl || !color || !IsActive() || !g_config.mirror || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return nullptr;
+    D3D12_RESOURCE_DESC cd = color->GetDesc();
+    const UINT w = (UINT)cd.Width, h = cd.Height;
+    const uint64_t frame = g_frameNo.load();
+    g_stats[kPasses]++;
+    // no other view's hair lately while the main view gets hair of the mirror's size: the learned main
+    // depth buffer is the mirror's - learn it again
+    if (g_otherDrawnFrame.load() + 2 < frame) {
+        if (++g_missed >= 30 && g_mainDsv.load() && g_mainDrawnFrame.load() + 1 >= frame &&
+            (w << 16 | h) == (g_colorW.load() << 16 | g_colorH.load())) {
+            Log("hair: main view depth buffer %p was a mirror's, forgotten", (void*)g_mainDsv.load());
+            g_mainDsv = nullptr;
+            g_missed = 0;
+        }
+        return nullptr;   // nothing to resolve
+    }
+    g_missed = 0;
+    Targets* t;
+    {
+        std::lock_guard<std::mutex> lock(g_resMutex);
+        t = g_other;
+    }
+    // this frame's hair is in its top-left w x h on the GPU by now (drawn on a list submitted earlier)
+    if (!t || t->w < w || t->h < h || t->needsInitialClear.load()) {
+        g_stats[kSkipSmall]++;
+        return nullptr;
+    }
+    if (g_mirrorSize.exchange(w << 16 | h) == 0) Log("hair: mirror %ux%u", w, h);
+    if (TypedFormat(cd.Format) != t->colorFormat) {
+        g_stats[kSkipFormat]++;
+        return nullptr;
+    }
+    if (!InitCompute()) {
+        g_stats[kSkipOther]++;
+        return nullptr;
+    }
+    g_stats[kResolved]++;
+    const ViewSettings mirror = g_config.mirrorView;
+    RecordResolve(cl, t, color, cd, nullptr, DXGI_FORMAT_UNKNOWN, nullptr, DXGI_FORMAT_UNKNOWN, false, false, w, h, mirror);
+    // the unsharp mask at the mirror's resolution (also debug views 4 and 7)
+    UnsharpMaskMirror(cl, t->output, w, h, t->cov, t->areaValid ? t->tensor : nullptr, mirror);
+    // read: back to render targets for the next frame's mirror hair (cleared by its first draw)
+    std::vector<D3D12_RESOURCE_BARRIER> bars;
+    Barrier(cl, t->cov, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
+    Barrier(cl, t->kept, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
+    Flush(cl, bars);
+    return t->output;   // NON_PIXEL_SHADER_RESOURCE; the result is its top-left w x h
+}
 
 }  // namespace hf

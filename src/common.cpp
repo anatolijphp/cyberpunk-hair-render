@@ -118,6 +118,17 @@ void LoadConfig() {
     c.usmRadius = strtof(ReadIni(ini, "Hair", "USMRadius", "2.99").c_str(), nullptr);
     c.usmThreshold = strtof(ReadIni(ini, "Hair", "USMThreshold", "0.01").c_str(), nullptr);
     c.stabilizeDepth = ParseBool(ReadIni(ini, "Hair", "StabilizeDepth", "true"), true);
+    c.mirror = ParseBool(ReadIni(ini, "Hair", "Mirror", "true"), true);
+    ViewSettings& m = c.mirrorView;
+    const std::string mr = ReadIni(ini, "Mirror", "Resolve", "strand");
+    m.resolveMode = mr == "box" ? 0 : mr == "neural" ? 2 : 1;
+    m.strength = strtof(ReadIni(ini, "Mirror", "Strength", "0.65").c_str(), nullptr);
+    m.area = strtof(ReadIni(ini, "Mirror", "Area", "0").c_str(), nullptr);
+    m.areaFeather = strtof(ReadIni(ini, "Mirror", "AreaFeather", "12.6").c_str(), nullptr);
+    m.usmEnabled = ParseBool(ReadIni(ini, "Mirror", "UnsharpMask", "true"), true);
+    m.usmAmount = strtof(ReadIni(ini, "Mirror", "USMAmount", "1.65").c_str(), nullptr);
+    m.usmRadius = strtof(ReadIni(ini, "Mirror", "USMRadius", "2.52").c_str(), nullptr);
+    m.usmThreshold = strtof(ReadIni(ini, "Mirror", "USMThreshold", "0").c_str(), nullptr);
     c.toggleKey = (int)strtol(ReadIni(ini, "Hair", "ToggleKey", "0x79").c_str(), nullptr, 0);
     c.overlayKey = (int)strtol(ReadIni(ini, "Hair", "OverlayKey", "0x24").c_str(), nullptr, 0);
     c.debugView = (int)strtol(ReadIni(ini, "Debug", "View", "0").c_str(), nullptr, 0);
@@ -180,6 +191,8 @@ void ReloadRuntimeConfig() {
     g_config.areaFeather = fresh.areaFeather;
     g_config.debugView = fresh.debugView;
     g_config.stabilizeDepth = fresh.stabilizeDepth;
+    g_config.mirror = fresh.mirror;
+    g_config.mirrorView = fresh.mirrorView;
     g_config.coverageMode = fresh.coverageMode;
     g_config.usmEnabled = fresh.usmEnabled;
     g_config.usmAmount = fresh.usmAmount;

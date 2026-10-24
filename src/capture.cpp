@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,12 +25,19 @@ namespace {
 
 struct Phase {
     bool fixOn;
-    int warmup;   // frames not recorded while FSR's history settles
-    int record;
+    int warmup;          // frames not recorded while FSR's history settles
+    int record;          // at most
+    bool output;         // the last kOutputFrames frames also keep the FSR output
+    bool untilCovered;   // game colour only, until every jitter of the first phase was seen in every
+                         // dither phase (prepare.py averages those into the reference)
 };
-constexpr Phase kPhases[] = {{true, 16, 64}, {false, 16, 64}};
-constexpr int kNumPhases = 2;
-constexpr int kOutputFrames = 8;      // the last frames of each phase also keep the FSR output
+// The game's hair dither repeats every kDitherPeriod frames (shaders/hair_coverage.hlsl, the frame
+// term of its noise) and FSR's jitter every few dozen, so the frames that share a jitter cover every
+// dither phase after a few jitter periods: averaging them per jitter removes the dither.
+constexpr Phase kPhases[] = {{true, 16, 64, true, false}, {false, 16, 64, true, false}, {false, 0, 2000, false, true}};
+constexpr int kNumPhases = 3;
+constexpr int kDitherPeriod = 5;
+constexpr int kOutputFrames = 8;
 constexpr int kMinSlots = 8, kMaxSlots = 48;
 constexpr UINT64 kSlotMemory = 768ull << 20;   // readback memory for the render-resolution buffers
 constexpr uint64_t kGpuDoneMs = 300;  // a frame's copies have certainly executed by then
@@ -59,6 +67,7 @@ struct FrameMeta {
     bool hasJitter;
     float jitter[2];
     bool output;
+    uint64_t game;   // upscaler frames since the capture started (recorded or not): the dither phase
 };
 
 std::mutex g_m;
@@ -104,6 +113,9 @@ D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_fp[kBufs]{};
 UINT g_bpp[kBufs]{};
 UINT64 g_bufSize = 0, g_outSize = 0;
 int g_phase = 0, g_phaseFrame = 0, g_recorded = 0, g_written = 0, g_waited = 0;
+uint64_t g_gameFrame = 0;
+std::map<uint64_t, uint32_t> g_cover;   // jitter -> dither phases recorded (bit mask)
+std::vector<uint64_t> g_inputJitters;   // jitters of the first phase's frames
 bool g_done = false, g_wasActive = true;
 uint64_t g_startMs = 0, g_lastFrameMs = 0;
 int g_box[4]{};   // x, y, w, h at render resolution
@@ -286,14 +298,17 @@ void WriteMeta() {
         fprintf(f, "frame %d ms %llu fix %s targets %d output %d", m.index, (unsigned long long)m.ms,
                 kPhases[m.phase].fixOn ? "on" : "off", m.targets, m.output);
         if (m.hasJitter) fprintf(f, " jitter %.6f %.6f", m.jitter[0], m.jitter[1]);
+        fprintf(f, " game %llu", (unsigned long long)m.game);
         fputc('\n', f);
     }
     fclose(f);
 }
 
 void WriterThread() {
+    bool wrote = false;
     for (;;) {
-        Sleep(50);
+        if (!wrote) Sleep(50);   // keep writing while frames are ready: the capture waits for free buffers
+        wrote = false;
         uint64_t now = GetTickCount64();
         Slot* ready = nullptr;
         {
@@ -318,6 +333,7 @@ void WriterThread() {
                 if (m.index == ready->index) m.output = ready->output;
             ready->state = 0;
             ++g_written;
+            wrote = true;
             continue;
         }
         std::lock_guard<std::mutex> lock(g_m);
@@ -326,8 +342,11 @@ void WriterThread() {
         if (!g_done || busy) continue;
         WriteMeta();
         ReleaseSlots();
-        Log("capture: done, %d frames (waited %d frames for buffers) in %.1f s -> %ls", g_written, g_waited,
-            (GetTickCount64() - g_startMs) / 1000.0, g_dir.c_str());
+        int covered = 0;
+        for (uint64_t j : g_inputJitters) covered += g_cover[j] == (1u << kDitherPeriod) - 1;
+        Log("capture: done, %d frames (waited %d frames for buffers) in %.1f s, %d of %zu jitters in every "
+            "dither phase -> %ls", g_written, g_waited, (GetTickCount64() - g_startMs) / 1000.0, covered,
+            g_inputJitters.size(), g_dir.c_str());
         ReportStatus(g_requestId, g_written > 0, g_dir);
         g_running = false;
         return;
@@ -376,6 +395,9 @@ bool Start(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, const char* pat
     CreateDirectoryW(g_dir.c_str(), nullptr);
     g_path = path;
     g_phase = g_phaseFrame = g_recorded = g_written = g_waited = 0;
+    g_gameFrame = 0;
+    g_cover.clear();
+    g_inputJitters.clear();
     g_done = false;
     g_haveBox = false;
     g_current = nullptr;
@@ -472,6 +494,7 @@ void CaptureFrame(void* commandList, void* color, unsigned colorState, const flo
         g_running = true;
     }
     if (g_done) return;
+    const uint64_t game = g_gameFrame++;
     uint64_t now = GetTickCount64();
     g_lastFrameMs = now;
     if (g_current) {   // last frame had no output step
@@ -488,6 +511,21 @@ void CaptureFrame(void* commandList, void* color, unsigned colorState, const flo
         g_phaseFrame = 0;
         SetActive(kPhases[g_phase].fixOn);
         return;
+    }
+    // jitter key (the game's jitters are exact binary / ternary fractions)
+    const uint64_t key = jitter ? (uint64_t)(uint32_t)(int32_t)(jitter[0] * 1e6f) << 32 | (uint32_t)(int32_t)(jitter[1] * 1e6f) : 0;
+    if (ph.untilCovered) {
+        bool all = jitter != nullptr;
+        for (uint64_t j : g_inputJitters) all &= g_cover[j] == (1u << kDitherPeriod) - 1;
+        if (all) {   // done: the next frame ends the capture
+            g_phaseFrame = ph.warmup + ph.record;
+            return;
+        }
+        if (!jitter || std::find(g_inputJitters.begin(), g_inputJitters.end(), key) == g_inputJitters.end() ||
+            (g_cover[key] >> (game % kDitherPeriod) & 1)) {
+            ++g_phaseFrame;   // not needed (or already recorded): skipped, counted towards the cap
+            return;
+        }
     }
     void *cov = nullptr, *kept = nullptr, *resolved = nullptr;
     bool targets = PendingTargets(&cov, &kept, &resolved);
@@ -518,12 +556,17 @@ void CaptureFrame(void* commandList, void* color, unsigned colorState, const flo
     slot->index = g_recorded++;
     slot->phase = g_phase;
     slot->ms = now;
-    slot->wantOutput = r >= ph.record - kOutputFrames;
+    slot->wantOutput = ph.output && r >= ph.record - kOutputFrames;
     slot->output = false;
     slot->state = 1;
     g_current = slot;
-    FrameMeta m{slot->index, now - g_startMs, g_phase, ph.fixOn, jitter != nullptr, {0, 0}, false};
-    if (jitter) m.jitter[0] = jitter[0], m.jitter[1] = jitter[1];
+    FrameMeta m{slot->index, now - g_startMs, g_phase, ph.fixOn, jitter != nullptr, {0, 0}, false, game};
+    if (jitter) {
+        m.jitter[0] = jitter[0], m.jitter[1] = jitter[1];
+        g_cover[key] |= 1u << (game % kDitherPeriod);
+        if (g_phase == 0 && std::find(g_inputJitters.begin(), g_inputJitters.end(), key) == g_inputJitters.end())
+            g_inputJitters.push_back(key);
+    }
     g_frames.push_back(m);
 }
 

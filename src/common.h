@@ -10,6 +10,19 @@ namespace hf {
 
 constexpr float kAreaAll = 16.0f;
 
+// resolve and sharpening of one view: the main view's are Config's own fields ([Hair]), a mirror's
+// Config::mirrorView ([Mirror]: rendered without FSR, at its own scale)
+struct ViewSettings {
+    int resolveMode = 1;           // 0 box, 1 strand, 2 strand + network
+    float strength = 0.65f;
+    float area = 0.0f;
+    float areaFeather = 12.6f;
+    bool usmEnabled = true;
+    float usmAmount = 1.65f;
+    float usmRadius = 2.52f;       // in the view's own pixels
+    float usmThreshold = 0.0f;
+};
+
 struct Config {
     bool enabled = true;
     bool dumpShaders = false;      // dump hair shaders / root signatures
@@ -30,6 +43,8 @@ struct Config {
     int toggleKey = VK_F10;
     int overlayKey = VK_HOME;      // opens the settings overlay
     bool stabilizeDepth = true;    // hand FSR stable hair depth / motion (can reduce flicker)
+    bool mirror = true;            // also resolve hair in mirrors (their own view, no upscaler)
+    ViewSettings mirrorView;       // ... with these settings
     int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask,
                                    // 5 network mask, 6 network correction, 7 mod area
     bool probe = false;            // log compute work of a few frames (finding the built-in FSR 2.1)

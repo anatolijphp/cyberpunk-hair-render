@@ -35,6 +35,8 @@ DXGI_FORMAT TypedFormatForView(DXGI_FORMAT f) { return f; }
 unsigned D3D12StateFromFfx(unsigned s) { return s; }
 void* OverlayQueue() { return nullptr; }   // no GPU timing here
 void DescStats(size_t* a, size_t* b, size_t* c, size_t* d, size_t* e) { *a = *b = *c = *d = *e = 0; }
+void MirrorStats(char* buf, size_t size) { if (size) *buf = 0; }
+void MirrorPassStats(char* buf, size_t size) { if (size) *buf = 0; }
 }  // namespace hf
 
 namespace {

@@ -38,6 +38,8 @@ def read_meta(d):
             if "jitter" in p:
                 i = p.index("jitter")
                 f["jitter"] = (float(p[i + 1]), float(p[i + 2]))
+            if "game" in p:   # upscaler frame number since the capture started (the dither phase)
+                f["game"] = int(p[p.index("game") + 1])
             meta["frames"].append(f)
     return meta
 

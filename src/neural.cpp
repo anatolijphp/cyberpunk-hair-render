@@ -22,6 +22,7 @@
 
 #include "common.h"
 #include "descriptors.h"
+#include "fsr2.h"
 #include "hair.h"
 #include "../build/gen/nn_apply_cso.h"
 #include "../build/gen/nn_bbox_cso.h"
@@ -166,17 +167,18 @@ public:
     Network(const wchar_t* file, const char* label, UINT widen) : file_(file), label_(label), widen_(widen) {}
 
     // Runs the network on `out` in place (its current content is the base image). coverage / kept:
-    // R8 hair targets (NON_PIXEL_SHADER_RESOURCE) covering renderW x renderH of their texture; extra:
-    // the raw game frame for networks with 11 inputs (readable by compute), else null.
+    // hair targets (NON_PIXEL_SHADER_RESOURCE) covering renderW x renderH of their texture; extra:
+    // the raw game frame for networks with 11 inputs (readable by compute), else null. imageW / H: the
+    // image's part of `out` (0: all of it; a mirror's targets are larger than its image).
     bool Run(ID3D12GraphicsCommandList* cl, ID3D12Resource* out, D3D12_RESOURCE_STATES outState, ID3D12Resource* cov,
-             ID3D12Resource* kept, ID3D12Resource* extra, UINT renderW, UINT renderH) {
+             ID3D12Resource* kept, ID3D12Resource* extra, UINT renderW, UINT renderH, UINT imageW = 0, UINT imageH = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         ID3D12Device* dev = nullptr;
         out->GetDevice(IID_PPV_ARGS(&dev));
         bool ok = dev && InitShared(dev) && Init();
         if (dev) dev->Release();
         if (!ok || (inputs_ == 11 && !extra)) return false;
-        return Record(cl, out, outState, cov, kept, extra, renderW, renderH);
+        return Record(cl, out, outState, cov, kept, extra, renderW, renderH, imageW, imageH);
     }
 
     void TakeTime(double* ms, UINT* samples) {
@@ -364,10 +366,11 @@ private:
         return true;
     }
 
+    // at least the output's size (only grows: a mirror's image changes size every frame)
     ID3D12Resource* CopyTarget(const D3D12_RESOURCE_DESC& out) {
         if (copy_) {
             D3D12_RESOURCE_DESC d = copy_->GetDesc();
-            if (d.Width == out.Width && d.Height == out.Height && d.Format == out.Format) return copy_;
+            if (d.Width >= out.Width && d.Height >= out.Height && d.Format == out.Format) return copy_;
         }
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -389,13 +392,15 @@ private:
     }
 
     bool Record(ID3D12GraphicsCommandList* cl, ID3D12Resource* out, D3D12_RESOURCE_STATES outState,
-                ID3D12Resource* cov, ID3D12Resource* kept, ID3D12Resource* extra, UINT renderW, UINT renderH) {
+                ID3D12Resource* cov, ID3D12Resource* kept, ID3D12Resource* extra, UINT renderW, UINT renderH,
+                UINT imageW, UINT imageH) {
         D3D12_RESOURCE_DESC od = out->GetDesc();
         DXGI_FORMAT fmt = TypedFormatForView(od.Format);
         if (!(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || fmt == DXGI_FORMAT_UNKNOWN) return false;
         ID3D12Resource* copy = CopyTarget(od);
         if (!copy) return false;
-        const UINT dw = (UINT)od.Width, dh = od.Height;   // the base image (display or render resolution)
+        // the base image (display or render resolution), the top-left part of `out`
+        const UINT dw = imageW ? imageW : (UINT)od.Width, dh = imageH ? imageH : od.Height;
         D3D12_RESOURCE_DESC cd = cov->GetDesc();
         const float uvx = (float)renderW / (float)cd.Width / (float)dw, uvy = (float)renderH / (float)cd.Height / (float)dh;
 
@@ -426,7 +431,11 @@ private:
         Transition(bars, out, outState, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(bars, copy, copyState_, D3D12_RESOURCE_STATE_COPY_DEST);
         Submit(cl, bars);
-        cl->CopyResource(copy, out);
+        D3D12_TEXTURE_COPY_LOCATION to{copy, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}},
+            from{out, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        to.SubresourceIndex = from.SubresourceIndex = 0;
+        const D3D12_BOX image{0, 0, 0, dw, dh, 1};
+        cl->CopyTextureRegion(&to, 0, 0, 0, &from, &image);
         if (!weightsReady_) {
             cl->CopyBufferRegion(weights_, 0, upload_, 0, weightData_.size() * 4);
             Transition(bars, weights_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -545,6 +554,7 @@ private:
 };
 
 Network g_resolve(L"hairfix_resolve.bin", "resolve", 1);   // render resolution: mask widened by 1 pixel
+Network g_mirror(L"hairfix_resolve.bin", "mirror", 1);     // the same network on mirrors (own buffers)
 
 }  // namespace
 
@@ -554,6 +564,15 @@ bool NeuralResolve(void* commandList, void* resolved, unsigned resolvedState, vo
     return g_resolve.Run(static_cast<ID3D12GraphicsCommandList*>(commandList), static_cast<ID3D12Resource*>(resolved),
                          (D3D12_RESOURCE_STATES)resolvedState, static_cast<ID3D12Resource*>(coverage),
                          static_cast<ID3D12Resource*>(kept), static_cast<ID3D12Resource*>(raw), renderW, renderH);
+}
+
+bool NeuralResolveMirror(void* commandList, void* resolved, unsigned resolvedState, void* raw, void* coverage,
+                         void* kept, unsigned width, unsigned height) {
+    if (!commandList || !resolved || !raw || !coverage || !kept) return false;   // the caller checks the setting
+    return g_mirror.Run(static_cast<ID3D12GraphicsCommandList*>(commandList), static_cast<ID3D12Resource*>(resolved),
+                        (D3D12_RESOURCE_STATES)resolvedState, static_cast<ID3D12Resource*>(coverage),
+                        static_cast<ID3D12Resource*>(kept), static_cast<ID3D12Resource*>(raw), width, height, width,
+                        height);
 }
 
 void PerfOnPresent() {
@@ -568,18 +587,25 @@ void PerfOnPresent() {
     ++frames;
     double seconds = (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart;
     if (seconds < 10) return;
-    double msR;
-    UINT nR;
+    double msR, msM;
+    UINT nR, nM;
     g_resolve.TakeTime(&msR, &nR);
+    g_mirror.TakeTime(&msM, &nM);
     PROCESS_MEMORY_COUNTERS_EX pm{};
     pm.cb = sizeof(pm);
     K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof(pm));
     size_t heaps, visible, replaced, bytes, created;
     DescStats(&heaps, &visible, &replaced, &bytes, &created);
-    Log("perf: %.1f fps, network %.2f ms (%u frames), private %.0f MB, descriptor heaps %zu "
-        "(%zu visible, %zu replaced, %zu created, %.0f MB tracked)",
-        frames / seconds, nR ? msR / nR : 0.0, nR, pm.PrivateUsage / 1048576.0, heaps, visible, replaced, created,
-        bytes / 1048576.0);
+    Log("perf: %.1f fps, network %.2f ms (%u frames), mirror network %.2f ms (%u frames), private %.0f MB, "
+        "descriptor heaps %zu (%zu visible, %zu replaced, %zu created, %.0f MB tracked)",
+        frames / seconds, nR ? msR / nR : 0.0, nR, nM ? msM / nM : 0.0, nM, pm.PrivateUsage / 1048576.0, heaps, visible,
+        replaced, created, bytes / 1048576.0);
+    if (g_config.mirror) {
+        char a[320], b[160];
+        MirrorStats(a, sizeof(a));
+        MirrorPassStats(b, sizeof(b));
+        Log("mirror: %s; %s", a, b);
+    }
     frames = 0;
     start = now;
 }

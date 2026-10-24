@@ -1,4 +1,5 @@
-// Unsharp mask on hair, applied to the upscaler output after the upscale.
+// Unsharp mask on hair, applied to the upscaler output after the upscale, and to a mirror's resolve
+// (at its own resolution: mirrors have no upscaler).
 #include <d3d12.h>
 
 #include <cstring>
@@ -23,8 +24,11 @@ UINT g_inc = 0;
 UINT g_ring = 0;
 bool g_failed = false;
 
-ID3D12Resource* g_copy = nullptr;   // copy of the upscaler output (blur source)
-D3D12_RESOURCE_STATES g_copyState = D3D12_RESOURCE_STATE_COPY_DEST;
+struct Copy {   // copy of the image (blur source)
+    ID3D12Resource* res = nullptr;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+};
+Copy g_copy, g_mirrorCopy;
 std::mutex g_mutex;
 
 bool Init(ID3D12Device* dev) {
@@ -53,12 +57,12 @@ bool Init(ID3D12Device* dev) {
     return true;
 }
 
-// copy texture matching the output (recreated on size / format change; the old one is leaked,
-// it may still be in flight)
-ID3D12Resource* CopyTarget(const D3D12_RESOURCE_DESC& out) {
-    if (g_copy) {
-        D3D12_RESOURCE_DESC d = g_copy->GetDesc();
-        if (d.Width == out.Width && d.Height == out.Height && d.Format == out.Format) return g_copy;
+// copy texture of at least the output's size and its format (recreated when too small or of another
+// format; the old one is leaked, it may still be in flight)
+ID3D12Resource* CopyTarget(Copy& copy, const D3D12_RESOURCE_DESC& out) {
+    if (copy.res) {
+        D3D12_RESOURCE_DESC d = copy.res->GetDesc();
+        if (d.Width >= out.Width && d.Height >= out.Height && d.Format == out.Format) return copy.res;
     }
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -74,10 +78,10 @@ ID3D12Resource* CopyTarget(const D3D12_RESOURCE_DESC& out) {
     if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
                                                  nullptr, IID_PPV_ARGS(&r))))
         return nullptr;
-    g_copy = r;
-    g_copyState = D3D12_RESOURCE_STATE_COPY_DEST;
+    copy.res = r;
+    copy.state = D3D12_RESOURCE_STATE_COPY_DEST;
     Log("usm: copy target %llux%u fmt=%d", (unsigned long long)out.Width, out.Height, out.Format);
-    return g_copy;
+    return r;
 }
 
 void Transition(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
@@ -95,6 +99,93 @@ void Transition(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, D3D12
 void Submit(ID3D12GraphicsCommandList* cl, std::vector<D3D12_RESOURCE_BARRIER>& v) {
     if (!v.empty()) cl->ResourceBarrier((UINT)v.size(), v.data());
     v.clear();
+}
+
+// The unsharp mask on the top-left imageW x imageH of `out` (in outState, UAV-capable), from the hair
+// coverage `cov` (its texture covWxcovH, this frame in its top-left renderW x renderH) and the area
+// map (null: all hair); amount, radius (in the image's pixels), threshold.
+void Sharpen(ID3D12GraphicsCommandList* cl, ID3D12Resource* out, D3D12_RESOURCE_STATES outState, UINT imageW,
+             UINT imageH, ID3D12Resource* cov, UINT covW, UINT covH, UINT renderW, UINT renderH, ID3D12Resource* area,
+             float amount, float radius, float threshold, Copy& copySlot) {
+    const Config& cfg = g_config;
+    D3D12_RESOURCE_DESC od = out->GetDesc();
+    DXGI_FORMAT fmt = TypedFormatForView(od.Format);
+    if (!(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || fmt == DXGI_FORMAT_UNKNOWN) {
+        static bool warned = false;
+        if (!warned) Log("usm: output format %d flags 0x%x not writable", od.Format, od.Flags);
+        warned = true;
+        return;
+    }
+    ID3D12Resource* copy = CopyTarget(copySlot, od);
+    if (!copy) return;
+
+    UINT slot = (g_ring++ % kRing) * kSetSize;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_heap->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)slot * g_inc;
+    gpu.ptr += (UINT64)slot * g_inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+    s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    s.Texture2D.MipLevels = 1;
+    s.Format = fmt;
+    g_device->CreateShaderResourceView(copy, &s, cpu);
+    cpu.ptr += g_inc;
+    s.Format = kCoverageFormat;
+    g_device->CreateShaderResourceView(cov, &s, cpu);
+    cpu.ptr += g_inc;
+    s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g_device->CreateShaderResourceView(area, &s, cpu);
+    cpu.ptr += g_inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+    u.Format = fmt;
+    u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_device->CreateUnorderedAccessView(out, nullptr, &u, cpu);
+
+    std::vector<D3D12_RESOURCE_BARRIER> bars;
+    Transition(bars, out, outState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(bars, copy, copySlot.state, D3D12_RESOURCE_STATE_COPY_DEST);
+    Submit(cl, bars);
+    D3D12_TEXTURE_COPY_LOCATION to{copy, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}},
+        from{out, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    to.SubresourceIndex = from.SubresourceIndex = 0;
+    const D3D12_BOX image{0, 0, 0, imageW, imageH, 1};
+    cl->CopyTextureRegion(&to, 0, 0, 0, &from, &image);
+    Transition(bars, out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Transition(bars, copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Submit(cl, bars);
+    copySlot.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    struct {
+        uint32_t displayW, displayH;
+        float renderW, renderH, covW, covH;
+        float amount, radius, threshold;
+        uint32_t debugView, useArea, pad;
+    } c = {imageW, imageH, (float)renderW, (float)renderH, (float)covW, (float)covH,
+           amount, radius > 0.3f ? radius : 0.3f, threshold,
+           (uint32_t)(cfg.debugView == 4 || cfg.debugView == 7 ? cfg.debugView : 0), area ? 1u : 0u, 0};
+    static_assert(sizeof(c) == 12 * 4, "root constant layout");
+    cl->SetDescriptorHeaps(1, &g_heap);
+    cl->SetComputeRootSignature(g_rootSig);
+    cl->SetComputeRoot32BitConstants(0, 12, &c, 0);
+    cl->SetComputeRootDescriptorTable(1, gpu);
+    cl->SetPipelineState(g_pso);
+    cl->Dispatch((imageW + 7) / 8, (imageH + 7) / 8, 1);
+
+    D3D12_RESOURCE_BARRIER uavBarrier{};
+    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarrier.UAV.pResource = out;
+    bars.push_back(uavBarrier);
+    Transition(bars, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outState);
+    Submit(cl, bars);
+}
+
+bool Ready(ID3D12Resource* out) {   // g_mutex held
+    ID3D12Device* dev = nullptr;
+    out->GetDevice(IID_PPV_ARGS(&dev));
+    bool ok = Init(dev);
+    if (dev) dev->Release();
+    return ok;
 }
 
 }  // namespace
@@ -117,81 +208,13 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
     if (!cl || !out || !cov) return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    ID3D12Device* dev = nullptr;
-    out->GetDevice(IID_PPV_ARGS(&dev));
-    bool ok = Init(dev);
-    if (dev) dev->Release();
-    if (!ok) return;
-
+    if (!Ready(out)) return;
     D3D12_RESOURCE_DESC od = out->GetDesc();
-    DXGI_FORMAT fmt = TypedFormatForView(od.Format);
-    if (!(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || fmt == DXGI_FORMAT_UNKNOWN) {
-        static bool warned = false;
-        if (!warned) Log("usm: output format %d flags 0x%x not writable", od.Format, od.Flags);
-        warned = true;
-        return;
-    }
-    ID3D12Resource* copy = CopyTarget(od);
-    if (!copy) return;
-
-    UINT slot = (g_ring++ % kRing) * kSetSize;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_heap->GetGPUDescriptorHandleForHeapStart();
-    cpu.ptr += (SIZE_T)slot * g_inc;
-    gpu.ptr += (UINT64)slot * g_inc;
-    D3D12_SHADER_RESOURCE_VIEW_DESC s{};
-    s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    s.Texture2D.MipLevels = 1;
-    s.Format = fmt;
-    g_device->CreateShaderResourceView(copy, &s, cpu);
-    cpu.ptr += g_inc;
-    s.Format = kCoverageFormat;
-    g_device->CreateShaderResourceView(cov, &s, cpu);
-    cpu.ptr += g_inc;
     void* areaRes = nullptr;
     bool useArea = PendingArea(&areaRes);
-    s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    g_device->CreateShaderResourceView(useArea ? static_cast<ID3D12Resource*>(areaRes) : nullptr, &s, cpu);
-    cpu.ptr += g_inc;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
-    u.Format = fmt;
-    u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g_device->CreateUnorderedAccessView(out, nullptr, &u, cpu);
-
-    auto outState = (D3D12_RESOURCE_STATES)D3D12StateFromFfx(ffxOutputState);
-    std::vector<D3D12_RESOURCE_BARRIER> bars;
-    Transition(bars, out, outState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Transition(bars, copy, g_copyState, D3D12_RESOURCE_STATE_COPY_DEST);
-    Submit(cl, bars);
-    cl->CopyResource(copy, out);
-    Transition(bars, out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Transition(bars, copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Submit(cl, bars);
-    g_copyState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-    struct {
-        uint32_t displayW, displayH;
-        float renderW, renderH, covW, covH;
-        float amount, radius, threshold;
-        uint32_t debugView, useArea, pad;
-    } c = {(uint32_t)od.Width, od.Height, (float)renderW, (float)renderH, (float)covW, (float)covH,
-           cfg.usmAmount, cfg.usmRadius > 0.3f ? cfg.usmRadius : 0.3f, cfg.usmThreshold,
-           (uint32_t)(cfg.debugView == 4 || cfg.debugView == 7 ? cfg.debugView : 0), useArea ? 1u : 0u, 0};
-    static_assert(sizeof(c) == 12 * 4, "root constant layout");
-    cl->SetDescriptorHeaps(1, &g_heap);
-    cl->SetComputeRootSignature(g_rootSig);
-    cl->SetComputeRoot32BitConstants(0, 12, &c, 0);
-    cl->SetComputeRootDescriptorTable(1, gpu);
-    cl->SetPipelineState(g_pso);
-    cl->Dispatch(((UINT)od.Width + 7) / 8, (od.Height + 7) / 8, 1);
-
-    D3D12_RESOURCE_BARRIER uavBarrier{};
-    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uavBarrier.UAV.pResource = out;
-    bars.push_back(uavBarrier);
-    Transition(bars, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outState);
-    Submit(cl, bars);
+    Sharpen(cl, out, (D3D12_RESOURCE_STATES)D3D12StateFromFfx(ffxOutputState), (UINT)od.Width, od.Height, cov, covW,
+            covH, renderW, renderH, useArea ? static_cast<ID3D12Resource*>(areaRes) : nullptr, cfg.usmAmount,
+            cfg.usmRadius, cfg.usmThreshold, g_copy);
 
     static ID3D12Resource* lastOut = nullptr;
     static int changes = 0;
@@ -201,6 +224,27 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
         Log("usm: pass on %p %llux%u (render %ux%u) amount=%.2f radius=%.2f threshold=%.3f",
             (void*)out, (unsigned long long)od.Width, od.Height, renderW, renderH, cfg.usmAmount, cfg.usmRadius,
             cfg.usmThreshold);
+    }
+}
+
+void UnsharpMaskMirror(void* commandList, void* image, unsigned width, unsigned height, void* coverage, void* area,
+                       const ViewSettings& vs) {
+    const Config& cfg = g_config;
+    if (!vs.usmEnabled && cfg.debugView != 4 && cfg.debugView != 7) return;
+    auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
+    auto* out = static_cast<ID3D12Resource*>(image);
+    auto* cov = static_cast<ID3D12Resource*>(coverage);
+    if (!cl || !out || !cov) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!Ready(out)) return;
+    D3D12_RESOURCE_DESC cd = cov->GetDesc();
+    Sharpen(cl, out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, width, height, cov, (UINT)cd.Width, cd.Height,
+            width, height, static_cast<ID3D12Resource*>(area), vs.usmAmount, vs.usmRadius, vs.usmThreshold,
+            g_mirrorCopy);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log("usm: mirror pass %ux%u amount %.2f radius %.2f", width, height, vs.usmAmount, vs.usmRadius);
     }
 }
 

@@ -10,6 +10,10 @@ namespace hf {
 bool NeuralResolve(void* commandList, void* resolved, unsigned resolvedState, void* raw, void* coverage, void* kept,
                    unsigned renderW, unsigned renderH);
 
+// The same on a mirror's resolve (hair.h): `resolved` holds the image in its top-left width x height.
+bool NeuralResolveMirror(void* commandList, void* resolved, unsigned resolvedState, void* raw, void* coverage,
+                         void* kept, unsigned width, unsigned height);
+
 // training/engine_test.cpp: the network on given textures (resolved in d3d12State, raw / coverage /
 // kept in NON_PIXEL_SHADER_RESOURCE), without the game.
 bool NeuralTestResolve(void* commandList, void* resolved, unsigned d3d12State, void* raw, void* coverage, void* kept,
