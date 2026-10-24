@@ -436,6 +436,16 @@ void TrackComputeRootSignature(void* list, ID3D12RootSignature* rootSig) {
     for (auto& p : b.params) p.kind = kUnset;
 }
 
+void TrackListReset(void* list, ID3D12PipelineState* pso) {
+    Bindings& b = Get(list);
+    b.numHeaps = 0;
+    b.rootSig = nullptr;
+    b.overflow = false;
+    for (auto& p : b.params) p.kind = kUnset;
+    b.pso = pso;
+    b.pass = PassOf(pso);
+}
+
 void TrackPipelineState(void* list, ID3D12PipelineState* pso) {
     Bindings& b = Get(list);
     b.pso = pso;

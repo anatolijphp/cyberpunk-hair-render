@@ -46,7 +46,7 @@ enum Fn {
     kCreateCPSO, kLoadCPipe, kCreateHeap, kCreateSRV, kCreateUAV, kCopyDescs, kCopyDescsSimple,
     kCreateDSV,   // mirrors: the size of the depth buffer a hair draw uses tells its view
     kDispatch, kSetCTable, kBarrier, kSetHeaps, kSetCRootSig, kSetCConst, kSetCConsts, kSetCCbv, kSetCSrv, kSetCUav,
-    kClose,
+    kClose, kReset,
     // upscaler probe only
     kCreateQueue, kExecute,
     kCreateSCHwnd, kCreateSC, kPresent, kPresent1, kResizeBuffers, kResizeBuffers1, kFnCount
@@ -261,12 +261,24 @@ using PFN_SetPSO = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Pi
 using PFN_DrawIndexed = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 
-void STDMETHODCALLTYPE H_SetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
+void NotePipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
     t_list = self;
     t_pso = pso;
     int n1 = g_numHair.load(std::memory_order_relaxed), n2 = g_numHairGbuf.load(std::memory_order_relaxed);
     t_listKind = InSet(g_hairPsos, n1, pso) ? 1 : InSet(g_hairGbufPsos, n2, pso) ? 2 : 0;
     TrackPipelineState(self, pso);
+}
+
+// a list (re)starts recording: nothing bound but its initial PSO (the tracked state of its last
+// recording would be stale: the pass it belonged to, the bindings restored after an insertion)
+void NoteListStart(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
+    TrackListReset(self, pso);
+    TrackRenderTargets(self, 0, nullptr, FALSE, nullptr);
+    NotePipelineState(self, pso);
+}
+
+void STDMETHODCALLTYPE H_SetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
+    NotePipelineState(self, pso);
     if (ProbeCapturing()) ProbeSetPso(self, pso);
     Orig<PFN_SetPSO>(self, kSetPSO)(self, pso);
 }
@@ -387,6 +399,15 @@ HRESULT STDMETHODCALLTYPE H_Close(ID3D12GraphicsCommandList* self) {
     return Orig<PFN_Close>(self, kClose)(self);
 }
 
+using PFN_Reset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+
+HRESULT STDMETHODCALLTYPE H_Reset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* alloc,
+                                  ID3D12PipelineState* pso) {
+    HRESULT hr = Orig<PFN_Reset>(self, kReset)(self, alloc, pso);
+    if (SUCCEEDED(hr)) NoteListStart(self, pso);
+    return hr;
+}
+
 void HookCommandList(void* list) {
     void** vt = VtableOf(list);
     bool any = false;
@@ -402,6 +423,7 @@ void HookCommandList(void* list) {
     HOOK_CL(SetComputeRootShaderResourceView, kSetCSrv);
     HOOK_CL(SetComputeRootUnorderedAccessView, kSetCUav);
     HOOK_CL(Close, kClose);
+    HOOK_CL(Reset, kReset);
 #undef HOOK_CL
     any |= HookSlot(vt, VSLOT(ID3D12GraphicsCommandListVtbl, SetPipelineState), kSetPSO, (void*)H_SetPipelineState);
     any |= HookSlot(vt, VSLOT(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced), kDrawIndexed,
@@ -471,7 +493,11 @@ HRESULT STDMETHODCALLTYPE H_CreateCommandList(ID3D12Device* self, UINT mask, D3D
                                               ID3D12CommandAllocator* alloc, ID3D12PipelineState* pso, REFIID riid,
                                               void** out) {
     HRESULT hr = Orig<PFN_CreateCL>(self, kCreateCL)(self, mask, type, alloc, pso, riid, out);
-    if (SUCCEEDED(hr) && out && *out) OnCommandListCreated(*out, type);
+    if (SUCCEEDED(hr) && out && *out) {
+        OnCommandListCreated(*out, type);
+        // recording, with that initial PSO (the same object for every list interface)
+        if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) NoteListStart(static_cast<ID3D12GraphicsCommandList*>(*out), pso);
+    }
     return hr;
 }
 

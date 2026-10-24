@@ -28,7 +28,7 @@ struct Copy {   // copy of the image (blur source)
     ID3D12Resource* res = nullptr;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
 };
-Copy g_copy, g_mirrorCopy;
+Copy g_copy, g_mirrorCopy[2];   // the mirror's: RGBA16F, other formats
 std::mutex g_mutex;
 
 bool Init(ID3D12Device* dev) {
@@ -240,7 +240,7 @@ void UnsharpMaskMirror(void* commandList, void* image, unsigned width, unsigned 
     D3D12_RESOURCE_DESC cd = cov->GetDesc();
     Sharpen(cl, out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, width, height, cov, (UINT)cd.Width, cd.Height,
             width, height, static_cast<ID3D12Resource*>(area), vs.usmAmount, vs.usmRadius, vs.usmThreshold,
-            g_mirrorCopy);
+            g_mirrorCopy[TypedFormatForView(out->GetDesc().Format) == DXGI_FORMAT_R16G16B16A16_FLOAT ? 0 : 1]);
     static bool logged = false;
     if (!logged) {
         logged = true;

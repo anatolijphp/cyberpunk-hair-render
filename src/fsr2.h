@@ -22,6 +22,7 @@ void MirrorPassStats(char* buf, size_t size);      // counters since the last ca
 void TrackDescriptorHeaps(void* list, UINT n, ID3D12DescriptorHeap* const* heaps);
 void TrackComputeRootSignature(void* list, ID3D12RootSignature* rootSig);
 void TrackPipelineState(void* list, ID3D12PipelineState* pso);
+void TrackListReset(void* list, ID3D12PipelineState* pso);   // Reset / creation: nothing bound but pso
 void TrackComputeTable(void* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table);
 void TrackComputeConstants(void* list, UINT index, UINT n, const void* data, UINT offset);
 void TrackComputeRootView(void* list, UINT index, int kind, D3D12_GPU_VIRTUAL_ADDRESS va);   // 3 CBV, 4 SRV, 5 UAV
