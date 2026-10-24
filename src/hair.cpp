@@ -148,18 +148,12 @@ struct Targets {
     // so the next frame's hair always lands on cleared targets in GPU order.
     std::atomic<bool> needsInitialClear{true};
     bool areaValid = false;             // tensor .y holds this frame's Area map
-    // the other views' set: a second output for mirrors whose colour has another format (small, far
-    // mirrors are rendered in a smaller format), swapped in while resolving them
-    ID3D12Resource* altOutput = nullptr;
-    DXGI_FORMAT altFormat = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_STATES altState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 };
 
 std::mutex g_resMutex;
 ID3D12Device* g_device = nullptr;
 Targets* g_targets = nullptr;
 std::vector<std::pair<uint64_t, Targets*>> g_graveyard;   // (frame retired, targets)
-std::vector<std::pair<uint64_t, ID3D12Resource*>> g_deadResources;   // (frame retired, texture)
 
 std::atomic<uint64_t> g_frameNo{1};   // ages retired targets, tells the mirror's frames apart
 std::atomic<UINT> g_colorW{0}, g_colorH{0};
@@ -188,7 +182,7 @@ ID3D12Resource* MakeTexture(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAG
 void Release(Targets* t) {
     if (!t) return;
     for (IUnknown* u : {(IUnknown*)t->cov, (IUnknown*)t->kept, (IUnknown*)t->tensor, (IUnknown*)t->output,
-                        (IUnknown*)t->depthOut, (IUnknown*)t->motionOut, (IUnknown*)t->rtvHeap, (IUnknown*)t->altOutput})
+                        (IUnknown*)t->depthOut, (IUnknown*)t->motionOut, (IUnknown*)t->rtvHeap})
         if (u) u->Release();
     delete t;
 }
@@ -198,14 +192,6 @@ Targets* MakeTargets(UINT w, UINT h, DXGI_FORMAT colorFormat, DXGI_FORMAT motion
 // retired targets older than a few frames (g_resMutex held)
 void AgeGraveyard() {
     uint64_t frame = g_frameNo.load();
-    for (auto it = g_deadResources.begin(); it != g_deadResources.end();) {
-        if (frame > it->first + 16) {
-            it->second->Release();
-            it = g_deadResources.erase(it);
-        } else {
-            ++it;
-        }
-    }
     for (auto it = g_graveyard.begin(); it != g_graveyard.end();) {
         if (frame > it->first + 16) {
             Release(it->second);
@@ -761,8 +747,7 @@ static void RecordResolve(ID3D12GraphicsCommandList* cl, Targets* t, ID3D12Resou
     // the resolve network rewrites the resolve from it and the raw frame (debug views show the resolve)
     if (vs.resolveMode == 2 && view == 0) {   // each view has its own network buffers
         if (mainView) NeuralResolve(cl, t->output, kRead, color, t->cov, t->kept, w, h);
-        else if (t->colorFormat == kMirrorColorFormat)   // its copy texture has one format
-            NeuralResolveMirror(cl, t->output, kRead, color, t->cov, t->kept, w, h);
+        else NeuralResolveMirror(cl, t->output, kRead, color, t->cov, t->kept, w, h);
     }
     // [Hair] Area: the mod works only this far from strand edges. Outside, FSR gets the game's own
     // colour back, and the unsharp mask (usm.cpp) skips it: the map stays in .y of the tensor target
@@ -928,7 +913,7 @@ void MirrorStats(char* buf, size_t size) {
     const uint32_t m = g_mirrorSize.load();
     snprintf(buf, size,
              "hair draws main %u other views %u unknown-depth %u; mirror pass %u: resolved %u, skipped (targets "
-             "smaller %u, format %u, other %u); last mirror %ux%u, main %ux%u, main depth %s",
+             "not this frame's mirror size %u, format %u, other %u); last mirror %ux%u, main %ux%u, main depth %s",
              s[kMainDraws], s[kViewDraws], s[kNoDsv], s[kPasses], s[kResolved], s[kSkipSmall], s[kSkipFormat],
              s[kSkipOther], m >> 16, m & 0xffff, g_colorW.load(), g_colorH.load(), g_mainDsv.load() ? "known" : "unknown");
     if (const uint32_t k = g_lastSkipSize.exchange(0)) {
@@ -972,35 +957,24 @@ void* ResolveMirror(void* commandList, void* colorRes) {
         t = g_other;
     }
     // this frame's hair is in its top-left w x h on the GPU by now (drawn on a list submitted earlier)
-    const DXGI_FORMAT fmt = TypedFormat(cd.Format);
     auto skip = [&](Stat why) {
         g_stats[why]++;
         g_lastSkipSize = w << 16 | h;
         g_lastSkipFormat = (uint32_t)cd.Format;
         return nullptr;
     };
+    // the mirror pass's shader also copies other textures: only the colour of a view whose hair was
+    // drawn this or the last frame, at exactly its size, in the mirror's format, is a mirror
+    bool drawn = false;
+    {
+        std::lock_guard<std::mutex> lock(g_otherMutex);
+        for (const OtherDraw& o : g_otherDraws)
+            drawn |= o.dsv && o.frame + 1 >= frame && o.size == (w << 16 | h);
+    }
+    if (!drawn) return skip(kSkipSmall);
+    if (TypedFormat(cd.Format) != kMirrorColorFormat) return skip(kSkipFormat);
     if (!t || t->w < w || t->h < h || t->needsInitialClear.load()) return skip(kSkipSmall);
-    if (fmt == DXGI_FORMAT_UNKNOWN) return skip(kSkipFormat);
     if (!InitCompute()) return skip(kSkipOther);
-    // another colour format: the second output (kept, so a mirror switching formats costs nothing)
-    const bool alt = fmt != t->colorFormat;
-    if (alt && t->altFormat != fmt) {
-        if (t->altOutput) {   // may still be in flight
-            std::lock_guard<std::mutex> lock(g_resMutex);
-            g_deadResources.push_back({frame, t->altOutput});
-        }
-        t->altOutput = MakeTexture(t->w, t->h, fmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr);
-        t->altFormat = t->altOutput ? fmt : DXGI_FORMAT_UNKNOWN;
-        t->altState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        Log("hair: mirror output in format %d", fmt);
-        if (!t->altOutput) return skip(kSkipFormat);
-    }
-    if (alt) {
-        std::swap(t->output, t->altOutput);
-        std::swap(t->colorFormat, t->altFormat);
-        std::swap(t->outputState, t->altState);
-    }
     if (g_mirrorSize.exchange(w << 16 | h) == 0) Log("hair: mirror %ux%u", w, h);
     g_stats[kResolved]++;
     const ViewSettings mirror = g_config.mirrorView;
@@ -1012,13 +986,7 @@ void* ResolveMirror(void* commandList, void* colorRes) {
     Barrier(cl, t->cov, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
     Barrier(cl, t->kept, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
     Flush(cl, bars);
-    ID3D12Resource* result = t->output;   // NON_PIXEL_SHADER_RESOURCE; the result is its top-left w x h
-    if (alt) {
-        std::swap(t->output, t->altOutput);
-        std::swap(t->colorFormat, t->altFormat);
-        std::swap(t->outputState, t->altState);
-    }
-    return result;
+    return t->output;   // NON_PIXEL_SHADER_RESOURCE; the result is its top-left w x h
 }
 
 }  // namespace hf

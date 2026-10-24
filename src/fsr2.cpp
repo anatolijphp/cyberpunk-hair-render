@@ -343,12 +343,16 @@ std::atomic<uint32_t> g_mirrorPassCalls{0}, g_mirrorStateWaits{0};
 void MirrorBeforeDispatch(ID3D12GraphicsCommandList* cl, const Bindings& b) {
     g_mirrorPassCalls++;
     NoteMirrorPass();
-    DescInfo info;
+    DescInfo info, out;
     ID3D12Resource* color = FirstTexture(b, false, &info);
     if (!color) {
         LogOnce("mirror: colour not found in the final pass bindings");
         return;
     }
+    // the shader also copies other textures: the mirror's pass writes one RGBA16F image of its size
+    if (!FirstTexture(b, true, &out) || out.res == color || out.w != info.w || out.h != info.h ||
+        out.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT || info.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return;
     const int learned = g_mirrorState.load();
     if (learned < 0) {   // learned from the game's next barrier of it
         g_mirrorStateWaits++;
