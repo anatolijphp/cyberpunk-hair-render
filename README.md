@@ -18,7 +18,7 @@ the fix the hairline is a grainy dither pattern; with it the strands are soft an
 | | Fix off | Fix on |
 |---|---|---|
 | **FSR 2.1** | ![FSR 2.1, fix off](docs/fsr2-off.png) | ![FSR 2.1, fix on](docs/fsr2-on.png) |
-| **FSR 3** | ![FSR 3, fix off](docs/fsr3-off.png) | ![FSR 3, fix on](docs/fsr3-on.png) |
+| **FSR 3/4** | ![FSR 3, fix off](docs/fsr3-off.png) | ![FSR 3, fix on](docs/fsr3-on.png) |
 | **Mirror** | ![Mirror, fix off](docs/mirror-off.png) | ![Mirror, fix on](docs/mirror-on.png) |
 
 The mirror row is a crop of a 2560×1440 screenshot (FSR 3 Quality), not zoomed. A mirror is rendered
