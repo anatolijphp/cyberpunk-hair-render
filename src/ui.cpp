@@ -76,7 +76,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     bool keyDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     bool keyUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
     bool firstPress = keyDown && !(lp & (1 << 30));
-    if ((keyDown || keyUp) && ((int)wp == g_config.overlayKey || (int)wp == g_config.toggleKey)) {
+    if ((keyDown || keyUp) && ((int)wp == g_config.overlayKey || (int)wp == g_config.toggleKey ||
+                               (g_config.captureKey && (int)wp == g_config.captureKey))) {
         if (firstPress && (int)wp == g_config.overlayKey) SetVisible(!g_visible);
         return 0;   // our hotkeys are never passed to the game (F10 is read with GetAsyncKeyState)
     }
@@ -222,8 +223,10 @@ void SaveConfig() {
         put("Hair", key, b);
     };
     put("Hair", "Coverage", c.coverageMode == 1 ? "sharpen" : "raw");
-    put("Hair", "Resolve", c.resolveMode == 0 ? "box" : "strand");
+    put("Hair", "Resolve", c.resolveMode == 0 ? "box" : c.resolveMode == 2 ? "neural" : "strand");
     putf("Strength", c.strength);
+    putf("Area", c.area);
+    putf("AreaFeather", c.areaFeather);
     put("Hair", "StabilizeDepth", c.stabilizeDepth ? "true" : "false");
     putf("SharpenThreshold", c.sharpenThreshold);
     putf("SharpenWidth", c.sharpenWidth);
@@ -243,6 +246,8 @@ void ResetToDefaults() {
     c.coverageMode = d.coverageMode;
     c.resolveMode = d.resolveMode;
     c.strength = d.strength;
+    c.area = d.area;
+    c.areaFeather = d.areaFeather;
     c.stabilizeDepth = d.stabilizeDepth;
     c.sharpenThreshold = d.sharpenThreshold;
     c.sharpenWidth = d.sharpenWidth;
@@ -303,10 +308,20 @@ void DrawSettings() {
     }
 
     ImGui::SeparatorText("Resolve");
-    const char* resolve[] = {"Box (5x5)", "Strand-aligned"};
-    ImGui::Combo("Resolve", &c.resolveMode, resolve, 2);
+    const char* resolve[] = {"Box (5x5)", "Strand-aligned", "Strand + network"};
+    ImGui::Combo("Resolve", &c.resolveMode, resolve, 3);
+    ImGui::SetItemTooltip("Strand + network: a network refines the resolve from the raw frame;\n"
+                          "needs hairfix_resolve.bin next to the mod, else the strand resolve stays");
     ImGui::SliderFloat("Strength", &c.strength, 0.0f, 1.0f, "%.2f");
     ImGui::SetItemTooltip("0 = keep the most strand detail, 1 = smoothest");
+    ImGui::SliderFloat("Area", &c.area, 0.0f, kAreaAll, c.area >= kAreaAll ? "all hair" : "%.1f px from edges");
+    ImGui::SetItemTooltip("Where the mod works: how far (render pixels) from strand edges into fully\n"
+                          "filled hair. Outside, the image is the game's own, as without the mod\n"
+                          "(debug view: Mod area)");
+    ImGui::BeginDisabled(c.area >= kAreaAll);
+    ImGui::SliderFloat("Area transition", &c.areaFeather, 0.5f, 16.0f, "%.1f px");
+    ImGui::SetItemTooltip("How softly the mod fades out beyond the area: 0.5 = hard border, 16 = very soft");
+    ImGui::EndDisabled();
     ImGui::Checkbox("Stabilise depth / motion for FSR", &c.stabilizeDepth);
 
     ImGui::SeparatorText("Unsharp mask (after FSR, hair only)");
@@ -318,8 +333,9 @@ void DrawSettings() {
     ImGui::EndDisabled();
 
     ImGui::SeparatorText("Debug");
-    const char* views[] = {"Off", "Coverage", "Hair-surface mask", "Strand coherence", "Unsharp-mask mask"};
-    ImGui::Combo("View", &c.debugView, views, 5);
+    const char* views[] = {"Off", "Coverage", "Hair-surface mask", "Strand coherence", "Unsharp-mask mask",
+                           "Network mask", "Network correction", "Mod area"};
+    ImGui::Combo("View", &c.debugView, views, 8);
 
     ImGui::Separator();
     if (ImGui::Button("Save")) SaveConfig();
@@ -341,6 +357,8 @@ void DrawSettings() {
 }  // namespace
 
 bool OverlayVisible() { return g_visible.load(std::memory_order_relaxed); }
+
+void* OverlayQueue() { return g_queue; }
 
 void OverlayAttach(void* swapChain, void* queue, HWND hwnd) {
     std::lock_guard<std::mutex> lock(g_mutex);

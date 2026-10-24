@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common.h"
+#include "capture.h"
 #include "descriptors.h"
 #include "fsr2.h"
 #include "hair.h"
@@ -762,6 +763,8 @@ HRESULT STDMETHODCALLTYPE H_Present(IDXGISwapChain* self, UINT sync, UINT flags)
     DxgiScope scope;
     if (scope.outer && !(flags & DXGI_PRESENT_TEST)) {
         ProbePresent();
+        PerfOnPresent();
+        CapturePollKey();
         OverlayOnPresent(self);
     }
     return Orig<PFN_Present>(self, kPresent)(self, sync, flags);
@@ -771,6 +774,8 @@ HRESULT STDMETHODCALLTYPE H_Present1(IDXGISwapChain1* self, UINT sync, UINT flag
     DxgiScope scope;
     if (scope.outer && !(flags & DXGI_PRESENT_TEST)) {
         ProbePresent();
+        PerfOnPresent();
+        CapturePollKey();
         OverlayOnPresent(self);
     }
     return Orig<PFN_Present1>(self, kPresent1)(self, sync, flags, p);
@@ -890,7 +895,8 @@ UINT WINAPI H_GetRawInputData(HRAWINPUT input, UINT cmd, LPVOID data, PUINT size
         // our hotkeys never reach the game (F9 would quickload, for instance); while the overlay is
         // open no key does
         USHORT vk = ri->data.keyboard.VKey;
-        if (OverlayVisible() || vk == g_config.overlayKey || vk == g_config.toggleKey) {
+        if (OverlayVisible() || vk == g_config.overlayKey || vk == g_config.toggleKey ||
+            (g_config.captureKey && vk == g_config.captureKey)) {
             ri->data.keyboard.VKey = 0xFF;   // "no key"
             ri->data.keyboard.MakeCode = 0;
         }

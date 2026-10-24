@@ -1,8 +1,10 @@
 // Hair fix: side coverage pass (re-issued hair alpha_accum draws into our own targets) and the
 // guided resolve on the upscaler's colour input.
 #include "hair.h"
+#include "neural.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -13,6 +15,8 @@
 #include "../build/gen/coverage_table.h"
 #include "../build/gen/resolve_cso.h"
 #include "../build/gen/resolve_tensor_cso.h"
+#include "../build/gen/area_cso.h"
+#include "../build/gen/area_h_cso.h"
 
 namespace hf {
 namespace {
@@ -141,6 +145,7 @@ struct Targets {
     // Cleared once by the first side draw; afterwards by every resolve, right after reading them,
     // so the next frame's hair always lands on cleared targets in GPU order.
     std::atomic<bool> needsInitialClear{true};
+    bool areaValid = false;             // tensor .y holds this frame's Area map
 };
 
 std::mutex g_resMutex;
@@ -285,6 +290,8 @@ constexpr UINT kSetSize = 10;      // t0..t5, u0..u3
 ID3D12RootSignature* g_csRootSig = nullptr;
 ID3D12PipelineState* g_tensorPso = nullptr;
 ID3D12PipelineState* g_resolvePso = nullptr;
+ID3D12PipelineState* g_areaRowPso = nullptr;    // [Hair] Area: row distance to strand edges
+ID3D12PipelineState* g_areaPso = nullptr;       // ... distance, and the game's own image outside the area
 ID3D12DescriptorHeap* g_csHeap = nullptr;
 UINT g_csInc = 0;
 UINT g_ring = 0;
@@ -303,6 +310,14 @@ bool InitCompute() {
     if (SUCCEEDED(hr)) {
         d.CS = {kResolve_tensorCso, sizeof(kResolve_tensorCso)};
         hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&g_tensorPso));
+    }
+    if (SUCCEEDED(hr)) {
+        d.CS = {kArea_hCso, sizeof(kArea_hCso)};
+        hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&g_areaRowPso));
+    }
+    if (SUCCEEDED(hr)) {
+        d.CS = {kAreaCso, sizeof(kAreaCso)};
+        hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&g_areaPso));
     }
     if (SUCCEEDED(hr)) {
         D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * kSetSize,
@@ -574,7 +589,7 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     Flush(cl, bars);
 
     const Config& cfg = g_config;
-    uint32_t mode = (uint32_t)cfg.resolveMode;
+    uint32_t mode = cfg.resolveMode == 0 ? 0 : 1;   // box | strand (the network runs on the strand resolve)
     float strength = cfg.strength;
     uint32_t view = cfg.debugView <= 3 ? (uint32_t)cfg.debugView : 0;   // 4 is the unsharp-mask view
     uint32_t consts[8] = {t->w, t->h, mode, 0, view, stabilize ? 1u : 0u, 0, 0};
@@ -601,6 +616,45 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     t->outputState = kRead;
     t->auxState = kRead;
     t_pending = t;   // FinishUpscale returns the hair targets to render-target state and clears them
+    // the resolve network rewrites the resolve from it and the raw frame (debug views show the resolve)
+    if (cfg.resolveMode == 2 && view == 0)
+        NeuralResolve(cl, t->output, kRead, color, t->cov, t->kept, t->w, t->h);
+    // [Hair] Area: the mod works only this far from strand edges. Outside, FSR gets the game's own
+    // colour back, and the unsharp mask (usm.cpp) skips it: the map stays in .y of the tensor target
+    // (no longer needed by now; PendingArea hands it on)
+    t->areaValid = false;
+    if ((cfg.area < kAreaAll || cfg.debugView == 7) && view == 0) {
+        // width < 0: all hair (only the debug view gets here then)
+        float width = cfg.area < kAreaAll ? std::max(cfg.area, 0.0f) : -1.0f;
+        float feather = std::min(std::max(cfg.areaFeather, 0.5f), 32.0f);
+        uint32_t ac[8] = {t->w, t->h, 0, 0, (uint32_t)cfg.debugView, stabilize ? 1u : 0u, 0, 0};
+        memcpy(&ac[2], &width, 4);
+        memcpy(&ac[3], &feather, 4);
+        Barrier(cl, t->tensor, t->tensorState, kUav, bars);
+        Barrier(cl, t->output, kRead, kUav, bars);
+        Barrier(cl, t->depthOut, kRead, kUav, bars);
+        if (t->motionOut) Barrier(cl, t->motionOut, kRead, kUav, bars);
+        Flush(cl, bars);
+        cl->SetDescriptorHeaps(1, &g_csHeap);   // the network uses its own
+        cl->SetComputeRootSignature(g_csRootSig);
+        cl->SetComputeRoot32BitConstants(0, 8, ac, 0);
+        cl->SetComputeRootDescriptorTable(1, gpu);
+        cl->SetPipelineState(g_areaRowPso);
+        cl->Dispatch((t->w + 7) / 8, (t->h + 7) / 8, 1);
+        D3D12_RESOURCE_BARRIER u{};
+        u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        u.UAV.pResource = t->tensor;
+        cl->ResourceBarrier(1, &u);
+        cl->SetPipelineState(g_areaPso);
+        cl->Dispatch((t->w + 7) / 8, (t->h + 7) / 8, 1);
+        Barrier(cl, t->tensor, kUav, kRead, bars);
+        Barrier(cl, t->output, kUav, kRead, bars);
+        Barrier(cl, t->depthOut, kUav, kRead, bars);
+        if (t->motionOut) Barrier(cl, t->motionOut, kUav, kRead, bars);
+        Flush(cl, bars);
+        t->tensorState = kRead;
+        t->areaValid = true;
+    }
 
     static bool logged = false;
     if (!logged) {
@@ -616,11 +670,25 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     return true;
 }
 
+bool PendingArea(void** area) {
+    if (!t_pending || !t_pending->areaValid) return false;
+    *area = t_pending->tensor;
+    return true;
+}
+
 bool PendingCoverage(void** coverage, unsigned* width, unsigned* height) {
     if (!t_pending) return false;
     *coverage = t_pending->cov;
     *width = t_pending->w;
     *height = t_pending->h;
+    return true;
+}
+
+bool PendingTargets(void** coverage, void** kept, void** resolved) {
+    if (!t_pending) return false;
+    *coverage = t_pending->cov;
+    *kept = t_pending->kept;
+    *resolved = t_pending->output;
     return true;
 }
 

@@ -28,7 +28,7 @@ struct Heap {
 std::shared_mutex g_m;
 std::map<uintptr_t, std::unique_ptr<Heap>> g_heaps;   // by CPU start
 std::vector<Heap*> g_visible;                         // shader-visible heaps
-std::vector<std::unique_ptr<Heap>> g_retired;         // replaced heaps (may still be looked up)
+size_t g_created = 0, g_replaced = 0;                 // CBV/SRV/UAV heaps seen / replaced at a reused address
 
 Heap* HeapAt(uintptr_t cpu) {
     auto it = g_heaps.upper_bound(cpu);
@@ -58,10 +58,11 @@ void DescOnHeapCreated(void* heap) {
     dev->Release();
     h->slots.resize(h->num);
     std::unique_lock<std::shared_mutex> lock(g_m);
+    ++g_created;
     auto& entry = g_heaps[h->cpu];
-    if (entry) {   // a freed heap's address reused
+    if (entry) {   // a freed heap's address reused: its shadow goes (nobody holds slots across the lock)
         g_visible.erase(std::remove(g_visible.begin(), g_visible.end(), entry.get()), g_visible.end());
-        g_retired.push_back(std::move(entry));
+        ++g_replaced;
     }
     if (h->gpu) g_visible.push_back(h.get());
     entry = std::move(h);
@@ -112,6 +113,17 @@ void DescOnCopy(UINT numDst, const D3D12_CPU_DESCRIPTOR_HANDLE* dstStarts, const
         ++dOff;
         ++sOff;
     }
+}
+
+void DescStats(size_t* heaps, size_t* visible, size_t* retired, size_t* bytes, size_t* created) {
+    std::shared_lock<std::shared_mutex> lock(g_m);
+    *heaps = g_heaps.size();
+    *visible = g_visible.size();
+    *retired = g_replaced;
+    *created = g_created;
+    size_t b = 0;
+    for (auto& h : g_heaps) b += h.second->slots.size() * sizeof(DescInfo);
+    *bytes = b;
 }
 
 bool DescAt(uint64_t table, UINT offset, DescInfo* out) {

@@ -13,7 +13,7 @@ for target in windows linux; do
     name="cp2077-hairfix-$VERSION-$target"
     out="dist/$name"
     mkdir -p "$out/files"
-    cp build/amd_fidelityfx_loader_dx12.dll config/hairfix.ini "$out/files/"
+    cp build/amd_fidelityfx_loader_dx12.dll config/hairfix.ini models/hairfix_resolve.bin "$out/files/"
     cp README.md THIRD_PARTY_NOTICES.md "$out/"
     if [ "$target" = windows ]; then
         cp packaging/install.bat packaging/uninstall.bat "$out/"

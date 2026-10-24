@@ -1,4 +1,5 @@
 #include "common.h"
+#include "capture.h"
 #include "../build/gen/default_ini.h"
 
 #include <atomic>
@@ -60,7 +61,7 @@ void AfterUpscale(void* commandList, void* output, unsigned outputState) {
         Log("toggle: hair fix %s", on ? "ON" : "OFF");
     }
     g_keyWasDown = down;
-    if (now < g_bannerUntil.load())
+    if (now < g_bannerUntil.load() || CaptureActive())   // the banner stays up while a capture runs
         DrawBanner(g_ffxDevice, commandList, output, outputState, IsActive() ? "HAIR FIX ON" : "HAIR FIX OFF");
 }
 
@@ -106,8 +107,10 @@ void LoadConfig() {
     c.coverage = ReadIni(ini, "Hair", "Coverage", "raw");
     c.coverageMode = c.coverage == "sharpen" ? 1 : 0;
     c.resolve = ReadIni(ini, "Hair", "Resolve", "strand");
-    c.resolveMode = c.resolve == "box" ? 0 : 1;
+    c.resolveMode = c.resolve == "box" ? 0 : c.resolve == "neural" ? 2 : 1;
     c.strength = strtof(ReadIni(ini, "Hair", "Strength", "0.65").c_str(), nullptr);
+    c.area = strtof(ReadIni(ini, "Hair", "Area", "0").c_str(), nullptr);
+    c.areaFeather = strtof(ReadIni(ini, "Hair", "AreaFeather", "9.5").c_str(), nullptr);
     c.sharpenThreshold = strtof(ReadIni(ini, "Hair", "SharpenThreshold", "0.3").c_str(), nullptr);
     c.sharpenWidth = strtof(ReadIni(ini, "Hair", "SharpenWidth", "2.0").c_str(), nullptr);
     c.usmEnabled = ParseBool(ReadIni(ini, "Hair", "UnsharpMask", "true"), true);
@@ -121,6 +124,7 @@ void LoadConfig() {
     c.dumpShaders = ParseBool(ReadIni(ini, "Debug", "DumpShaders", "false"), false);
     c.logFrames = ParseBool(ReadIni(ini, "Debug", "LogFrames", "false"), false);
     c.probe = ParseBool(ReadIni(ini, "Debug", "ProbeUpscaler", "false"), false);
+    c.captureKey = (int)strtol(ReadIni(ini, "Debug", "CaptureKey", "0").c_str(), nullptr, 0);
     g_config = c;
     Log("config: enabled=%d coverage=%s resolve=%s strength=%.2f sharpen=%.2f/%.2f key=0x%x dump=%d view=%d stabilize=%d usm=%d (%.2f/%.2f/%.3f) probe=%d",
         c.enabled, c.coverage.c_str(), c.resolve.c_str(), c.strength, c.sharpenThreshold,
@@ -172,6 +176,8 @@ void ReloadRuntimeConfig() {
     g_config = old;
     g_config.resolveMode = fresh.resolveMode;
     g_config.strength = fresh.strength;
+    g_config.area = fresh.area;
+    g_config.areaFeather = fresh.areaFeather;
     g_config.debugView = fresh.debugView;
     g_config.stabilizeDepth = fresh.stabilizeDepth;
     g_config.coverageMode = fresh.coverageMode;

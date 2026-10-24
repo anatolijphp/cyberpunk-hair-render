@@ -3,3 +3,5 @@
 /dist/
 # local backups of game files (never commit game files)
 *.bak
+# python
+__pycache__/

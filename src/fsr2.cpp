@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 
+#include "capture.h"
 #include "common.h"
 #include "descriptors.h"
 #include "hair.h"
@@ -18,9 +19,9 @@ enum Pass { kOther, kLuminance, kAccumulate, kAccumulateFinal, kRcas, kPassCount
 constexpr uint64_t kLuminanceHash = 0x45e7974ee0f43114ull;    // compute luminance pyramid: reads the input colour
 constexpr uint64_t kAccumulateHash = 0x09caa46ea4ac6fc9ull;   // accumulate when sharpening is on (RCAS follows)
 constexpr uint64_t kAccumulateFinalHash = 0x75e26d49f7be43bbull;   // accumulate when sharpening is off: final output
-constexpr uint64_t kRcasHash = 0x623f6b3044f56e94ull;         // RCAS: final output
 // the accumulate pass's UAV table: internal colour (ping-pong), lock status, then (sharpening off) the output
 constexpr UINT kFinalOutputSlot = 2;
+constexpr uint64_t kRcasHash = 0x623f6b3044f56e94ull;         // RCAS: final output
 
 constexpr int kMaxPsos = 8;
 std::atomic<void*> g_psos[kPassCount][kMaxPsos];
@@ -186,6 +187,7 @@ void Resolve(ID3D12GraphicsCommandList* cl, const Bindings& b) {
         g_color = color;
         g_renderW = info.w;
         g_renderH = info.h;
+        CaptureNoteRenderSize(info.w, info.h);
         for (const Learned& l : g_learned)
             if (l.color == color) {
                 stateKnown = true;
@@ -208,17 +210,18 @@ void Resolve(ID3D12GraphicsCommandList* cl, const Bindings& b) {
     UpscaleInputs in, out;
     in.color = color;
     in.colorState = kFfxComputeRead;   // the luminance pass reads it as a compute SRV
-    if (!ResolveBeforeUpscale(cl, in, out)) return;
-    g_openList = cl;
-    if (!out.color) return;
+    bool resolved = ResolveBeforeUpscale(cl, in, out);
+    if (resolved) g_openList = cl;
     if (!stateKnown) return;   // first frame: the colour's state is learned from the game's next barrier
+    CaptureFrame(cl, color, state, nullptr, "fsr2");   // before the colour is overwritten
+    if (!resolved || !out.color) return;
     // the resolved colour replaces the game's input in place, for every FSR pass that reads it
-    auto* resolved = static_cast<ID3D12Resource*>(out.color);
+    auto* result = static_cast<ID3D12Resource*>(out.color);
     std::vector<D3D12_RESOURCE_BARRIER> bars;
     Transition(bars, color, state, D3D12_RESOURCE_STATE_COPY_DEST);
-    Transition(bars, resolved, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(bars, result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     cl->ResourceBarrier((UINT)bars.size(), bars.data());
-    cl->CopyResource(color, resolved);
+    cl->CopyResource(color, result);
     for (auto& br : bars) std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
     cl->ResourceBarrier((UINT)bars.size(), bars.data());
 }
@@ -233,6 +236,7 @@ void PostWork(ID3D12GraphicsCommandList* cl, ID3D12Resource* output) {
     g_pendingList = nullptr;
     g_openList = nullptr;
     if (output) {
+        CaptureOutput(cl, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);   // FSR's own output
         ApplyUnsharpMask(cl, output, kFfxUav, w, h);
         if (!g_ffxDevice) {
             ID3D12Device* dev = nullptr;

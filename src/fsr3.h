@@ -12,4 +12,10 @@ namespace hf {
 // Runs an upscale dispatch through `dispatch` (the original loader) with the hair fix around it.
 ffxReturnCode_t Fsr3Upscale(PfnFfxDispatch dispatch, ffxContext* context, const ffxDispatchDescUpscale* up);
 
+// Diagnostics: what the game asks the FFX API (render resolution, ratios, jitter) and how it sets up
+// the upscaler, to find out whether the render resolution can be steered from here.
+void Fsr3LogCreate(const ffxCreateContextDescHeader* desc);
+void Fsr3LogQuery(const ffxQueryDescHeader* desc, ffxReturnCode_t result);
+void Fsr3LogConfigure(const ffxConfigureDescHeader* desc);
+
 }  // namespace hf

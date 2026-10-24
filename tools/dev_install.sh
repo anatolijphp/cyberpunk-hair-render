@@ -9,4 +9,5 @@ if [ ! -f amd_fidelityfx_loader_dx12_orig.dll ]; then
     mv amd_fidelityfx_loader_dx12.dll amd_fidelityfx_loader_dx12_orig.dll
 fi
 cp "$SRC" amd_fidelityfx_loader_dx12.dll
+cp "$(dirname "$SRC")/../models/hairfix_resolve.bin" .
 echo "installed into $GAME"

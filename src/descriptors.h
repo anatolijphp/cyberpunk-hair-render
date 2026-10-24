@@ -25,4 +25,8 @@ void DescOnCopy(UINT numDst, const D3D12_CPU_DESCRIPTOR_HANDLE* dstStarts, const
 // descriptor `offset` of the table at GPU handle `table` (shader-visible heaps only)
 bool DescAt(uint64_t table, UINT offset, DescInfo* out);
 
+// diagnostics: heaps tracked, shader-visible ones, heaps replaced at a reused address, shadow memory in
+// bytes, heap creations
+void DescStats(size_t* heaps, size_t* visible, size_t* retired, size_t* bytes, size_t* created);
+
 }  // namespace hf

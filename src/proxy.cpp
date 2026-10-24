@@ -62,7 +62,10 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxC
                 hf::HookDeviceFromFfx(hf::g_ffxDevice);
             }
     }
-    if (hf::g_config.enabled) hf::FfxCreateBegin();
+    if (hf::g_config.enabled) {
+        hf::Fsr3LogCreate(desc);
+        hf::FfxCreateBegin();
+    }
     ffxReturnCode_t r = g_createContext(context, desc, memCb);
     if (hf::g_config.enabled) {
         hf::FfxCreateEnd();
@@ -88,13 +91,16 @@ __declspec(dllexport) ffxReturnCode_t ffxDestroyContext(ffxContext* context, con
 __declspec(dllexport) ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigureDescHeader* desc) {
     LoadOriginal();
     if (!g_loaded) return kErrorRuntime;
+    if (hf::g_config.enabled && desc) hf::Fsr3LogConfigure(desc);
     return g_configure(context, desc);
 }
 
 __declspec(dllexport) ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* desc) {
     LoadOriginal();
     if (!g_loaded) return kErrorRuntime;
-    return g_query(context, desc);
+    ffxReturnCode_t r = g_query(context, desc);
+    if (hf::g_config.enabled && desc) hf::Fsr3LogQuery(desc, r);
+    return r;
 }
 
 __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatchDescHeader* desc) {

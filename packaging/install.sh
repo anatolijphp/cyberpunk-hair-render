@@ -8,6 +8,6 @@ BIN="$GAME/bin/x64"
 if [ ! -f "$BIN/amd_fidelityfx_loader_dx12_orig.dll" ]; then
     mv "$BIN/amd_fidelityfx_loader_dx12.dll" "$BIN/amd_fidelityfx_loader_dx12_orig.dll"
 fi
-cp "$HERE/files/amd_fidelityfx_loader_dx12.dll" "$BIN/"
+cp "$HERE/files/amd_fidelityfx_loader_dx12.dll" "$HERE/files/hairfix_resolve.bin" "$BIN/"
 [ -f "$BIN/hairfix.ini" ] || cp "$HERE/files/hairfix.ini" "$BIN/"
 echo "installed into $BIN (an existing hairfix.ini was kept)"

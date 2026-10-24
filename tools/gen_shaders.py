@@ -20,13 +20,15 @@ VARIANTS = [
 ]
 SHARPEN_THRESHOLDS = [0.2, 0.3, 0.4, 0.5]
 SHARPEN_WIDTHS = [1.0, 1.5, 2.0, 3.0]
-COMPUTE = ["banner", "resolve", "resolve_tensor", "usm"]
+COMPUTE = ["banner", "resolve", "resolve_tensor", "area_h", "area", "usm", "nn_bbox", "nn_prep", "nn_conv", "nn_pool", "nn_apply"]
+# 16-bit math variants: (output name, source, profile, extra dxc arguments)
+COMPUTE16 = [("nn_conv16", "nn_conv", "cs_6_4", ["-enable-16bit-types", "-D", "HALF=1"])]
 GRAPHICS = [("imgui_vs", "vs_6_0"), ("imgui_ps", "ps_6_0")]   # overlay UI
 
 
-def compile_shader(name, profile, hlsl, defines=()):
+def compile_shader(name, profile, hlsl, defines=(), args=()):
     out = os.path.join(GEN, name + ".cso")
-    cmd = [os.path.join(DXC_DIR, "bin", "dxc"), "-T", profile, "-E", "main", "-O3", "-Fo", out, hlsl]
+    cmd = [os.path.join(DXC_DIR, "bin", "dxc"), "-T", profile, "-E", "main", "-O3", "-Fo", out, hlsl] + list(args)
     for d in defines:
         cmd += ["-D", d]
     env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(DXC_DIR, "lib"))
@@ -47,6 +49,12 @@ def main():
         data = compile_shader(name, "cs_6_0", os.path.join(shaders, name + ".hlsl"))
         with open(os.path.join(GEN, name + "_cso.h"), "w") as f:
             f.write("// generated from shaders/%s.hlsl\n" % name)
+            f.write(array("k%sCso" % name.capitalize(), data))
+
+    for name, source, profile, args in COMPUTE16:
+        data = compile_shader(name, profile, os.path.join(shaders, source + ".hlsl"), args=args)
+        with open(os.path.join(GEN, name + "_cso.h"), "w") as f:
+            f.write("// generated from shaders/%s.hlsl (16-bit math)\n" % source)
             f.write(array("k%sCso" % name.capitalize(), data))
 
     for name, profile in GRAPHICS:

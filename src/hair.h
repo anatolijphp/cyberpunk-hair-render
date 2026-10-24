@@ -33,6 +33,11 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
 // After the upscaler: the coverage target (render resolution, NON_PIXEL_SHADER_RESOURCE) of the
 // resolve that ran in this dispatch, for the unsharp mask; then FinishUpscale clears the targets.
 bool PendingCoverage(void** coverage, unsigned* width, unsigned* height);
+// The Area map of the same frame (RGBA16F, .y = 1 inside the area; same size as the coverage,
+// readable by compute), or false when the unsharp mask covers all hair.
+bool PendingArea(void** area);
+// All targets of that resolve (NON_PIXEL_SHADER_RESOURCE), for the training capture.
+bool PendingTargets(void** coverage, void** kept, void** resolved);
 void FinishUpscale(void* commandList);
 void OnHairFrameBoundary();
 

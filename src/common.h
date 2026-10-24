@@ -8,14 +8,18 @@
 
 namespace hf {
 
+constexpr float kAreaAll = 16.0f;
+
 struct Config {
     bool enabled = true;
     bool dumpShaders = false;      // dump hair shaders / root signatures
     bool logFrames = false;        // periodic hair draw counts in the log
     std::string coverage = "raw";  // raw | sharpen
-    std::string resolve = "strand";  // box | strand
-    int resolveMode = 1;           // 0 box, 1 strand (read by the render thread)
+    std::string resolve = "strand";  // box | strand | neural
+    int resolveMode = 1;           // 0 box, 1 strand, 2 strand + resolve network (read by the render thread)
     float strength = 0.65f;
+    float area = 0.0f;             // the mod works only this far (render px) from strand edges; >= kAreaAll: all hair
+    float areaFeather = 9.5f;      // width (render px) of the transition at the area's border
     float sharpenThreshold = 0.3f;
     float sharpenWidth = 2.0f;
     int coverageMode = 0;          // 0 raw, 1 sharpen (read by the render thread)
@@ -26,8 +30,10 @@ struct Config {
     int toggleKey = VK_F10;
     int overlayKey = VK_HOME;      // opens the settings overlay
     bool stabilizeDepth = true;    // hand FSR stable hair depth / motion (can reduce flicker)
-    int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask
+    int debugView = 0;             // 0 off, 1 coverage, 2 hair-surface mask, 3 strand coherence, 4 USM mask,
+                                   // 5 network mask, 6 network correction, 7 mod area
     bool probe = false;            // log compute work of a few frames (finding the built-in FSR 2.1)
+    int captureKey = 0;            // training capture key (0 = off), see capture.h
 };
 
 extern Config g_config;
@@ -54,6 +60,8 @@ void ReloadRuntimeConfig();             // re-read the settings that can change 
 
 // settings overlay (ui.cpp)
 bool OverlayVisible();
+void* OverlayQueue();                   // the game's presenting queue (ID3D12CommandQueue*), or null
+void PerfOnPresent();                   // periodic performance line in the log (neural.cpp)
 void OverlayAttach(void* swapChain, void* queue, HWND hwnd);
 void OverlayOnPresent(void* swapChain);
 void OverlayBeforeResize();

@@ -13,7 +13,7 @@ namespace hf {
 namespace {
 
 constexpr UINT kRing = 8;      // descriptor sets in flight
-constexpr UINT kSetSize = 3;   // t0 source copy, t1 coverage, u0 output
+constexpr UINT kSetSize = 4;   // t0 source copy, t1 coverage, t2 area map, u0 output
 
 ID3D12Device* g_device = nullptr;
 ID3D12RootSignature* g_rootSig = nullptr;
@@ -102,12 +102,17 @@ void Submit(ID3D12GraphicsCommandList* cl, std::vector<D3D12_RESOURCE_BARRIER>& 
 void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputState, unsigned renderW,
                       unsigned renderH) {
     const Config& cfg = g_config;
-    if (!cfg.usmEnabled && cfg.debugView != 4) return;
+    if (!cfg.usmEnabled && cfg.debugView != 4 && cfg.debugView != 7) return;
     void* covRes = nullptr;
     unsigned covW = 0, covH = 0;
-    if (!PendingCoverage(&covRes, &covW, &covH)) return;
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
     auto* out = static_cast<ID3D12Resource*>(outputRes);
+    if (!PendingCoverage(&covRes, &covW, &covH)) {
+        static bool warned = false;
+        if (!warned && out) Log("usm: no hair coverage for this upscale (hair resolve did not run) - skipped");
+        warned = true;
+        return;
+    }
     auto* cov = static_cast<ID3D12Resource*>(covRes);
     if (!cl || !out || !cov) return;
 
@@ -144,6 +149,11 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
     s.Format = DXGI_FORMAT_R8_UNORM;
     g_device->CreateShaderResourceView(cov, &s, cpu);
     cpu.ptr += g_inc;
+    void* areaRes = nullptr;
+    bool useArea = PendingArea(&areaRes);
+    s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g_device->CreateShaderResourceView(useArea ? static_cast<ID3D12Resource*>(areaRes) : nullptr, &s, cpu);
+    cpu.ptr += g_inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
     u.Format = fmt;
     u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -164,10 +174,10 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
         uint32_t displayW, displayH;
         float renderW, renderH, covW, covH;
         float amount, radius, threshold;
-        uint32_t debugView, pad0, pad1;
+        uint32_t debugView, useArea, pad;
     } c = {(uint32_t)od.Width, od.Height, (float)renderW, (float)renderH, (float)covW, (float)covH,
            cfg.usmAmount, cfg.usmRadius > 0.3f ? cfg.usmRadius : 0.3f, cfg.usmThreshold,
-           (uint32_t)(cfg.debugView == 4 ? 4 : 0), 0, 0};
+           (uint32_t)(cfg.debugView == 4 || cfg.debugView == 7 ? cfg.debugView : 0), useArea ? 1u : 0u, 0};
     static_assert(sizeof(c) == 12 * 4, "root constant layout");
     cl->SetDescriptorHeaps(1, &g_heap);
     cl->SetComputeRootSignature(g_rootSig);
@@ -183,11 +193,13 @@ void ApplyUnsharpMask(void* commandList, void* outputRes, unsigned ffxOutputStat
     Transition(bars, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outState);
     Submit(cl, bars);
 
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        Log("usm: first pass %llux%u (render %ux%u) amount=%.2f radius=%.2f threshold=%.3f",
-            (unsigned long long)od.Width, od.Height, renderW, renderH, cfg.usmAmount, cfg.usmRadius,
+    static ID3D12Resource* lastOut = nullptr;
+    static int changes = 0;
+    if (lastOut != out && changes < 8) {   // also when the upscaler (and so its output) changes
+        lastOut = out;
+        ++changes;
+        Log("usm: pass on %p %llux%u (render %ux%u) amount=%.2f radius=%.2f threshold=%.3f",
+            (void*)out, (unsigned long long)od.Width, od.Height, renderW, renderH, cfg.usmAmount, cfg.usmRadius,
             cfg.usmThreshold);
     }
 }
