@@ -487,8 +487,8 @@ private:
                         Constants(cl, c);
                         cl->Dispatch((n + 7) / 8, (n + 7) / 8, st.cout);
                     } else {
-                        struct { UINT size, cinA, cinB, cout, upA, wOffset, act; int ox, oy; UINT level, pad[6]; } c{
-                            n, st.cinA, st.cinB, st.cout, st.upA, st.wOffset, st.act, ox, oy, st.level, {}};
+                        struct { UINT size, cinA, cinB, cout, upA, wOffset, act; int ox, oy; UINT level, round16, pad[5]; } c{
+                            n, st.cinA, st.cinB, st.cout, st.upA, st.wOffset, st.act, ox, oy, st.level, g_bufBytes == 2, {}};
                         cl->SetPipelineState(g_psoConv);
                         Constants(cl, c);
                         cl->Dispatch((n + 7) / 8, (n + 7) / 8, (st.cout + 7) / 8);

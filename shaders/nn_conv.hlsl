@@ -20,8 +20,17 @@ cbuffer Params : register(b0) {
     uint act;             // 1: LeakyReLU
     int originX, originY; // display pixel of full-resolution buffer pixel (0, 0)
     uint level;           // this layer's resolution: full >> level
-    uint pad0, pad1, pad2, pad3, pad4, pad5;
+    uint round16;         // 16-bit buffers: round to nearest here (stores may round toward zero, which
+                          // drifts over the layers)
+    uint pad1, pad2, pad3, pad4, pad5;
 };
+
+// x rounded to the nearest 16-bit float mantissa (ties to even) with integer maths: f32tof16 may round
+// toward zero too. Exact for the 16-bit normal range, which is all that matters here.
+float RoundToHalf(float x) {
+    uint u = asuint(x);
+    return asfloat((u + 0xfffu + ((u >> 13) & 1u)) & ~0x1fffu);
+}
 
 Buffer<float> weights : register(t3);
 RWBuffer<float> dst : register(u0);
@@ -109,6 +118,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local 
         if (co >= cout) break;
         float x = acc[k] + weights[biasOffset + co];
         if (act) x = x > 0 ? x : 0.1 * x;
+        if (round16) x = RoundToHalf(x);
         dst[(co * size + id.y) * size + id.x] = x;
     }
 }
