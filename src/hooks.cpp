@@ -253,27 +253,25 @@ void OnComputePsoCreated(void* pso, const D3D12_SHADER_BYTECODE& cs) {
 // ---------------------------------------------------------------------------------------------
 // command list hooks
 
-thread_local void* t_list = nullptr;   // last list SetPipelineState was called on (this thread)
-thread_local int t_listKind = 0;       // 1 = alpha_accum PSO bound, 2 = gbuffer_solid bound
-thread_local void* t_pso = nullptr;    // PSO bound by that SetPipelineState
 
 using PFN_SetPSO = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
 using PFN_DrawIndexed = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 
 void NotePipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
-    t_list = self;
-    t_pso = pso;
     int n1 = g_numHair.load(std::memory_order_relaxed), n2 = g_numHairGbuf.load(std::memory_order_relaxed);
-    t_listKind = InSet(g_hairPsos, n1, pso) ? 1 : InSet(g_hairGbufPsos, n2, pso) ? 2 : 0;
+    if (ListGraphics* g = GraphicsOf(self, true)) {
+        g->pso = pso;
+        g->hairKind = InSet(g_hairPsos, n1, pso) ? 1 : InSet(g_hairGbufPsos, n2, pso) ? 2 : 0;
+    }
     TrackPipelineState(self, pso);
 }
 
 // a list (re)starts recording: nothing bound but its initial PSO (the tracked state of its last
 // recording would be stale: the pass it belonged to, the bindings restored after an insertion)
 void NoteListStart(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
-    TrackListReset(self, pso);
-    TrackRenderTargets(self, 0, nullptr, FALSE, nullptr);
+    MirrorListReset(self);       // its recording is gone: so are its pending mirror descriptors
+    TrackListReset(self, pso);   // also the render targets
     NotePipelineState(self, pso);
 }
 
@@ -283,21 +281,24 @@ void STDMETHODCALLTYPE H_SetPipelineState(ID3D12GraphicsCommandList* self, ID3D1
     Orig<PFN_SetPSO>(self, kSetPSO)(self, pso);
 }
 
-inline void CountDraw(ID3D12GraphicsCommandList* self) {
-    if (t_list != self || !t_listKind) return;
-    (t_listKind == 1 ? g_frameAlphaDraws : g_frameGbufDraws).fetch_add(1, std::memory_order_relaxed);
+// the list's hair PSO kind (0: none bound), counted for the frame log
+inline const ListGraphics* HairDraw(ID3D12GraphicsCommandList* self) {
+    const ListGraphics* g = GraphicsOf(self, false);
+    if (!g || !g->hairKind) return nullptr;
+    (g->hairKind == 1 ? g_frameAlphaDraws : g_frameGbufDraws).fetch_add(1, std::memory_order_relaxed);
+    return g;
 }
 
 void STDMETHODCALLTYPE H_DrawIndexedInstanced(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, INT d, UINT e) {
     Orig<PFN_DrawIndexed>(self, kDrawIndexed)(self, a, b, c, d, e);
-    CountDraw(self);
-    if (t_list == self && t_listKind == 1) AfterAlphaAccumDraw(self, t_pso, true, a, b, c, d, e);
+    const ListGraphics* g = HairDraw(self);
+    if (g && g->hairKind == 1) AfterAlphaAccumDraw(self, g->pso, true, a, b, c, d, e);
 }
 
 void STDMETHODCALLTYPE H_DrawInstanced(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d) {
     Orig<PFN_Draw>(self, kDraw)(self, a, b, c, d);
-    CountDraw(self);
-    if (t_list == self && t_listKind == 1) AfterAlphaAccumDraw(self, t_pso, false, a, b, c, (INT)d, 0);
+    const ListGraphics* g = HairDraw(self);
+    if (g && g->hairKind == 1) AfterAlphaAccumDraw(self, g->pso, false, a, b, c, (INT)d, 0);
 }
 
 using PFN_OMSetRT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
@@ -455,7 +456,7 @@ using PFN_CreateCL1 = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_CO
 HRESULT STDMETHODCALLTYPE H_CreateRootSignature(ID3D12Device* self, UINT mask, const void* blob, SIZE_T len,
                                                 REFIID riid, void** out) {
     HRESULT hr = Orig<PFN_CreateRootSig>(self, kCreateRootSig)(self, mask, blob, len, riid, out);
-    if (SUCCEEDED(hr) && out && *out && g_config.dumpShaders) {
+    if (SUCCEEDED(hr) && out && *out) {   // kept: shader dumps, and the mirror pass's table layout
         std::lock_guard<std::mutex> lock(g_mutex);
         auto* b = static_cast<const uint8_t*>(blob);
         g_rootSigBlobs[*out].assign(b, b + len);
@@ -582,6 +583,7 @@ void STDMETHODCALLTYPE H_CopyDescriptorsSimple(ID3D12Device* self, UINT n, D3D12
 }
 
 void STDMETHODCALLTYPE H_ExecuteCommandLists(ID3D12CommandQueue* self, UINT n, ID3D12CommandList* const* lists) {
+    MirrorBeforeExecute(n, reinterpret_cast<void* const*>(lists));   // the game's descriptors are final now
     ProbeExecute(self, n, reinterpret_cast<void* const*>(lists));
     Orig<PFN_Execute>(self, kExecute)(self, n, lists);
 }
@@ -590,7 +592,7 @@ HRESULT STDMETHODCALLTYPE H_CreateCommandQueue(ID3D12Device* self, const D3D12_C
                                                void** out) {
     HRESULT hr = Orig<PFN_CreateQueue>(self, kCreateQueue)(self, d, riid, out);
     if (SUCCEEDED(hr) && d && out && *out) {
-        Log("probe: command queue %p type=%d", *out, d->Type);
+        Log("command queue %p type=%d", *out, d->Type);
         HookSlot(VtableOf(*out), VSLOT(ID3D12CommandQueueVtbl, ExecuteCommandLists), kExecute,
                  (void*)H_ExecuteCommandLists);
     }
@@ -600,8 +602,7 @@ HRESULT STDMETHODCALLTYPE H_CreateCommandQueue(ID3D12Device* self, const D3D12_C
 int HookDeviceCompute(ID3D12Device* dev) {
     void** vt = VtableOf(dev);
     int n = 0;
-    if (ProbeEnabled())
-        n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateCommandQueue), kCreateQueue, (void*)H_CreateCommandQueue);
+    n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateCommandQueue), kCreateQueue, (void*)H_CreateCommandQueue);
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateComputePipelineState), kCreateCPSO,
                   (void*)H_CreateComputePipelineState);
     n += HookSlot(vt, VSLOT(ID3D12DeviceVtbl, CreateDescriptorHeap), kCreateHeap, (void*)H_CreateDescriptorHeap);
@@ -956,6 +957,14 @@ LONG_PTR WINAPI H_GetWindowLongPtrW(HWND hwnd, int index) {
 }
 
 }  // namespace
+
+bool RootSignatureBlob(void* rootSig, std::vector<uint8_t>* blob) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_rootSigBlobs.find(rootSig);
+    if (it == g_rootSigBlobs.end()) return false;
+    *blob = it->second;
+    return true;
+}
 
 bool InstallD3D12Hooks() {
     HMODULE exe = GetModuleHandleW(nullptr);

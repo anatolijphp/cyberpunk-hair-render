@@ -6,6 +6,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -13,12 +14,15 @@
 #include <vector>
 
 #include "common.h"
+#include "descriptors.h"
+#include "fsr2.h"
 #include "pso.h"
 #include "../build/gen/coverage_table.h"
 #include "../build/gen/resolve_cso.h"
 #include "../build/gen/resolve_tensor_cso.h"
 #include "../build/gen/area_cso.h"
 #include "../build/gen/area_h_cso.h"
+#include "../build/gen/mirror_copy_cso.h"
 
 namespace hf {
 namespace {
@@ -114,17 +118,6 @@ void MakeSideDesc(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const CoverageShader& v
 // ---------------------------------------------------------------------------------------------
 // render-target / render-pass tracking (per recording thread)
 
-struct RtState {
-    void* list = nullptr;
-    UINT n = 0;
-    D3D12_CPU_DESCRIPTOR_HANDLE rts[8]{};
-    BOOL single = FALSE;
-    bool hasDsv = false;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
-};
-thread_local RtState t_rt;
-thread_local void* t_passList = nullptr;
-thread_local bool t_inPass = false;
 
 // ---------------------------------------------------------------------------------------------
 // resources
@@ -136,6 +129,7 @@ struct Targets {
     ID3D12Resource* kept = nullptr;     // R8 hair-surface mask (RT, cleared to 0)
     ID3D12Resource* tensor = nullptr;   // RGBA16F strand direction / coherence (UAV)
     ID3D12Resource* output = nullptr;   // resolved colour handed to FSR
+    ID3D12Resource* work = nullptr;     // the other views' set: a copy of the mirror's image (RGBA16F UAV)
     ID3D12Resource* depthOut = nullptr; // stabilised depth (R32F)
     ID3D12Resource* motionOut = nullptr;// stabilised motion vectors
     DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
@@ -182,7 +176,7 @@ ID3D12Resource* MakeTexture(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAG
 void Release(Targets* t) {
     if (!t) return;
     for (IUnknown* u : {(IUnknown*)t->cov, (IUnknown*)t->kept, (IUnknown*)t->tensor, (IUnknown*)t->output,
-                        (IUnknown*)t->depthOut, (IUnknown*)t->motionOut, (IUnknown*)t->rtvHeap})
+                        (IUnknown*)t->depthOut, (IUnknown*)t->motionOut, (IUnknown*)t->rtvHeap, (IUnknown*)t->work})
         if (u) u->Release();
     delete t;
 }
@@ -219,15 +213,19 @@ Targets* CurrentTargets() {
 // ---------------------------------------------------------------------------------------------
 // mirrors: the game renders a mirror as a second view (its own depth buffer, no upscaler, no temporal
 // AA; its size follows how much of the screen it covers, up to the main view's) and draws hair into it
-// with the same passes, on another command list than the mirror's final compute pass (fsr2.cpp), the
-// two recorded in parallel. Hair goes to the main view's targets only for the main view's depth buffer
-// once that is known; any other depth buffer's hair goes to one more set of targets (grow-only, the
-// frame's hair in its top-left part). Everything else follows from the GPU order of a frame: that hair,
-// then the mirror's final pass (which reads it at its colour's size), then the main view's upscale,
-// after which the set is cleared. The main view's depth buffer is learned at the upscale: one of
-// exactly its size that drew hair for kLearnFrames upscales in a row without a mirror pass (a mirror's
-// first hair can come before its first pass is recorded, from another thread). Until it is known, hair
-// of the main view's size goes to the main view while no mirror pass ran lately.
+// with the same passes. Hair goes to the main view's targets for the main view's depth buffer; any
+// other depth buffer's hair goes to one more set of targets (grow-only, the frame's hair in its
+// top-left part), cleared after each main view upscale.
+// The mirror's image is finished by one compute pass (fsr2.cpp knows it by its shader). Its textures
+// are new every frame, and the game records the mirror's hair, its passes and their descriptors on
+// several threads: while recording, the descriptor of this frame's image may not be written yet. So
+// the mod records its work right after that pass on its own textures (copy, resolve, copy back) and
+// reaches the game's image only through a descriptor of its own, filled from the game's final one when
+// the list is submitted, and only if that is the mirror's image (MirrorBeforeExecute); the image keeps
+// the state the pass left it in.
+// The main view's depth buffer is learned at the upscale: the one its hair used for a while without a
+// mirror. Until then hair of the main view's size goes to the main view while no mirror ran lately; a
+// wrong guess is forgotten when mirror passes find no hair in the other views' set.
 
 struct DsvInfo {
     ID3D12Resource* res = nullptr;
@@ -255,14 +253,47 @@ OtherDraw g_otherDraws[kOtherDraws];
 std::mutex g_otherMutex;                        // taken before g_resMutex
 std::atomic<ID3D12Resource*> g_mainDsv{nullptr};
 std::atomic<uint64_t> g_mainDrawnFrame{0};      // last frame with hair in the main view's targets
-std::atomic<uint64_t> g_otherDrawnFrame{0};     // ... in the other set
 std::atomic<uint64_t> g_mirrorPassFrame{0};     // last frame the mirror's final pass ran
 std::atomic<uint32_t> g_mirrorSize{0};          // the last mirror pass's colour (log)
-std::atomic<int> g_missed{0};                   // mirror passes in a row without other hair lately
+std::atomic<int> g_missed{0};                   // mirror passes in a row whose hair went to the main view
+// the sizes of the depth buffers that drew hair lately, any view (validating the mirror's pass)
+struct HairSize {
+    std::atomic<uint32_t> size{0};
+    std::atomic<uint64_t> frame{0};
+};
+constexpr int kHairSizes = 4;
+HairSize g_hairSizes[kHairSizes];
+std::atomic<uint32_t> g_hairSizeNext{0};
+
+void NoteHairSize(uint32_t size, uint64_t frame) {
+    for (HairSize& s : g_hairSizes)
+        if (s.size.load(std::memory_order_relaxed) == size) {
+            s.frame.store(frame, std::memory_order_relaxed);
+            return;
+        }
+    HairSize& s = g_hairSizes[g_hairSizeNext.fetch_add(1) % kHairSizes];
+    s.size.store(size, std::memory_order_relaxed);
+    s.frame.store(frame, std::memory_order_relaxed);
+}
+
+// a mirror's size changes from frame to frame, and its hair may be recorded after its final pass (in
+// parallel): sizes within this many pixels count as the same view (the GPU sees the same frame's)
+constexpr int kSizeSlack = 64;
+bool SameSize(uint32_t a, uint32_t b) {
+    return std::abs((int)(a >> 16) - (int)(b >> 16)) <= kSizeSlack && std::abs((int)(a & 0xffff) - (int)(b & 0xffff)) <= kSizeSlack;
+}
+
+bool HairSizeRecent(uint32_t size, uint64_t frame) {   // drawn this frame or the last
+    for (const HairSize& s : g_hairSizes)
+        if (SameSize(s.size.load(std::memory_order_relaxed), size) && s.frame.load(std::memory_order_relaxed) + 1 >= frame)
+            return true;
+    return false;
+}
 constexpr DXGI_FORMAT kMirrorColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;   // the mirror's lit colour
 
 // counters for the perf log line (MirrorStats)
-enum Stat { kMainDraws, kViewDraws, kNoDsv, kPasses, kResolved, kSkipSmall, kSkipFormat, kSkipOther, kStats };
+enum Stat { kMainDraws, kViewDraws, kNoDsv, kPasses, kResolved, kSkipSmall, kSkipOther, kSkipOff,
+            kSkipNotDirect, kSkipNoHair, kApplied, kRejected, kDropped, kStats };
 std::atomic<uint32_t> g_stats[kStats];
 std::atomic<uint32_t> g_lastSkipSize{0}, g_lastSkipFormat{0};   // the last skipped mirror pass's colour
 
@@ -285,13 +316,17 @@ Targets* OtherTargets(const DsvInfo& d) {
     }
     slot->size = d.size;
     slot->frame = frame;
-    g_otherDrawnFrame = frame;
     std::lock_guard<std::mutex> rl(g_resMutex);
     Targets* t = g_other;
     if (t && t->w >= w && t->h >= h) return t;
     UINT nw = (std::max(w, t ? t->w : 0u) + 63) / 64 * 64, nh = (std::max(h, t ? t->h : 0u) + 63) / 64 * 64;
     if (t) g_graveyard.push_back({frame, t});
     g_other = MakeTargets(nw, nh, kMirrorColorFormat, DXGI_FORMAT_UNKNOWN, "other view targets");
+    if (g_other && !(g_other->work = MakeTexture(nw, nh, kMirrorColorFormat, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr))) {
+        Release(g_other);
+        g_other = nullptr;
+    }
     return g_other;
 }
 
@@ -512,7 +547,9 @@ DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
     }
 }
 
-thread_local Targets* t_pending = nullptr;   // resolved this dispatch, targets still readable
+// resolved this frame, targets still readable (one main upscale per frame; with FSR 2.1 its passes may be
+// recorded by different threads)
+std::atomic<Targets*> g_pending{nullptr};
 
 void ClearTargets(ID3D12GraphicsCommandList* cl, Targets* t) {
     const float one[4] = {1, 1, 1, 1}, zero[4] = {0, 0, 0, 0};
@@ -599,37 +636,40 @@ void ForgetGamePso(void* gamePso) {
 
 void TrackRenderTargets(void* list, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single,
                         const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
-    t_rt.list = list;
-    t_rt.n = n > 8 ? 8 : n;
-    t_rt.single = single;
-    UINT copy = single ? (n ? 1 : 0) : t_rt.n;
-    for (UINT i = 0; i < copy && rts; ++i) t_rt.rts[i] = rts[i];
-    t_rt.hasDsv = dsv != nullptr;
-    if (dsv) t_rt.dsv = *dsv;
+    ListGraphics* g = GraphicsOf(list, true);
+    if (!g) return;
+    g->rtCount = n > 8 ? 8 : n;
+    g->rtSingle = single;
+    UINT copy = single ? (n ? 1 : 0) : g->rtCount;
+    for (UINT i = 0; i < copy && rts; ++i) g->rts[i] = rts[i];
+    g->hasDsv = dsv != nullptr;
+    if (dsv) g->dsv = *dsv;
 }
 
 void TrackRenderPass(void* list, bool inside) {
-    t_passList = list;
-    t_inPass = inside;
+    if (ListGraphics* g = GraphicsOf(list, true)) g->inPass = inside;
 }
 
 void AfterAlphaAccumDraw(void* list, void* gamePso, bool indexed, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (!IsActive()) return;
     ID3D12PipelineState* side = SideFor(gamePso);
     if (!side) return;
-    if (t_inPass && t_passList == list) {
+    const ListGraphics* g = GraphicsOf(list, false);
+    if (!g) return;
+    if (g->inPass) {
         LogOnce("hair: alpha_accum drawn inside a D3D12 render pass - side pass not supported yet");
         return;
     }
-    if (t_rt.list != list || !t_rt.hasDsv) {
+    if (!g->hasDsv) {
         LogOnce("hair: render targets of the alpha_accum draw unknown - side pass skipped");
         return;
     }
+    const ListGraphics saved = *g;   // our own OMSetRenderTargets / SetPipelineState below update it
     // the view (see "mirrors" above)
     DsvInfo dsv;
     {
         std::lock_guard<std::mutex> lock(g_dsvMutex);
-        auto it = g_dsvs.find(t_rt.dsv.ptr);
+        auto it = g_dsvs.find(saved.dsv.ptr);
         if (it != g_dsvs.end()) dsv = it->second;
     }
     const uint32_t mainSize = g_colorW.load() << 16 | g_colorH.load();
@@ -638,6 +678,7 @@ void AfterAlphaAccumDraw(void* list, void* gamePso, bool indexed, UINT a, UINT b
     const bool main = !dsv.res || dsv.res == g_mainDsv.load() ||
                       (dsv.size == mainSize && (!g_config.mirror || (!g_mainDsv.load() && !MirrorLately())));
     if (!main && !g_config.mirror) return;
+    if (dsv.res) NoteHairSize(dsv.size, g_frameNo.load());
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
     Targets* t;
     if (main) {
@@ -656,13 +697,12 @@ void AfterAlphaAccumDraw(void* list, void* gamePso, bool indexed, UINT a, UINT b
         if (!t) return;
         if (t->needsInitialClear.exchange(false)) ClearTargets(cl, t);   // later: after each upscale
     }
-    RtState saved = t_rt;   // our own OMSetRenderTargets below goes through the tracking hook
     cl->OMSetRenderTargets(2, t->rtv, FALSE, &saved.dsv);
     cl->SetPipelineState(side);
     if (indexed) cl->DrawIndexedInstanced(a, b, c, d, e);
     else cl->DrawInstanced(a, b, c, (UINT)d);
     cl->SetPipelineState(static_cast<ID3D12PipelineState*>(gamePso));
-    cl->OMSetRenderTargets(saved.n, saved.n ? saved.rts : nullptr, saved.single, &saved.dsv);
+    cl->OMSetRenderTargets(saved.rtCount, saved.rtCount ? saved.rts : nullptr, saved.rtSingle, &saved.dsv);
 }
 
 // The resolve of one view: colour (compute-readable) -> t->output, from the view's hair targets (left
@@ -803,8 +843,8 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     auto* motion = static_cast<ID3D12Resource*>(in.motion);
     if (!cl || !color) return false;
     D3D12_RESOURCE_DESC cd = color->GetDesc();
-    g_colorW = (UINT)cd.Width;
-    g_colorH = cd.Height;
+    if (g_colorW.exchange((UINT)cd.Width) != cd.Width || g_colorH.exchange(cd.Height) != cd.Height)
+        g_mainDsv = nullptr;   // a new render size: a new depth buffer (the fallback covers it until learned)
     g_colorFormat = (int)TypedFormat(cd.Format);
     LearnMainView((UINT)cd.Width, cd.Height);
     DXGI_FORMAT motionFmt = motion ? TypedFormat(motion->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
@@ -838,7 +878,7 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
     main.area = g_config.area;
     main.areaFeather = g_config.areaFeather;
     RecordResolve(cl, t, color, cd, depth, depthFmt, motion, motionFmt, stabilize, true, t->w, t->h, main);
-    t_pending = t;   // FinishUpscale returns the hair targets to render-target state and clears them
+    g_pending = t;   // FinishUpscale returns the hair targets to render-target state and clears them
     out.color = t->output;
     if (stabilize) {
         out.depth = t->depthOut;
@@ -848,30 +888,32 @@ bool ResolveBeforeUpscale(void* commandList, const UpscaleInputs& in, UpscaleInp
 }
 
 bool PendingArea(void** area) {
-    if (!t_pending || !t_pending->areaValid) return false;
-    *area = t_pending->tensor;
+    Targets* t = g_pending.load();
+    if (!t || !t->areaValid) return false;
+    *area = t->tensor;
     return true;
 }
 
 bool PendingCoverage(void** coverage, unsigned* width, unsigned* height) {
-    if (!t_pending) return false;
-    *coverage = t_pending->cov;
-    *width = t_pending->w;
-    *height = t_pending->h;
+    Targets* t = g_pending.load();
+    if (!t) return false;
+    *coverage = t->cov;
+    *width = t->w;
+    *height = t->h;
     return true;
 }
 
 bool PendingTargets(void** coverage, void** kept, void** resolved) {
-    if (!t_pending) return false;
-    *coverage = t_pending->cov;
-    *kept = t_pending->kept;
-    *resolved = t_pending->output;
+    Targets* t = g_pending.load();
+    if (!t) return false;
+    *coverage = t->cov;
+    *kept = t->kept;
+    *resolved = t->output;
     return true;
 }
 
 void FinishUpscale(void* commandList) {
-    Targets* t = t_pending;
-    t_pending = nullptr;
+    Targets* t = g_pending.exchange(nullptr);
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
     {
         // the other views' hair of this frame was read by the mirror pass by now (GPU order)
@@ -905,20 +947,20 @@ void HairOnDepthView(void* resource, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
 
 uint64_t HairFrame() { return g_frameNo.load(); }
 
-void NoteMirrorPass() { g_mirrorPassFrame = g_frameNo.load(); }
-
 void MirrorStats(char* buf, size_t size) {
     uint32_t s[kStats];
     for (int i = 0; i < kStats; ++i) s[i] = g_stats[i].exchange(0);
     const uint32_t m = g_mirrorSize.load();
     snprintf(buf, size,
-             "hair draws main %u other views %u unknown-depth %u; mirror pass %u: resolved %u, skipped (targets "
-             "not this frame's mirror size %u, format %u, other %u); last mirror %ux%u, main %ux%u, main depth %s",
-             s[kMainDraws], s[kViewDraws], s[kNoDsv], s[kPasses], s[kResolved], s[kSkipSmall], s[kSkipFormat],
-             s[kSkipOther], m >> 16, m & 0xffff, g_colorW.load(), g_colorH.load(), g_mainDsv.load() ? "known" : "unknown");
+             "hair draws main %u other views %u unknown-depth %u; mirror pass %u: recorded %u, skipped (no mirror "
+             "hair %u, targets %u, fix off %u, not direct %u, other %u); at submission: image found %u, not the "
+             "mirror's %u, list reset %u; last mirror %ux%u, main %ux%u, main depth %s",
+             s[kMainDraws], s[kViewDraws], s[kNoDsv], s[kPasses], s[kResolved], s[kSkipNoHair], s[kSkipSmall],
+             s[kSkipOff], s[kSkipNotDirect], s[kSkipOther], s[kApplied], s[kRejected], s[kDropped], m >> 16, m & 0xffff,
+             g_colorW.load(), g_colorH.load(), g_mainDsv.load() ? "known" : "unknown");
     if (const uint32_t k = g_lastSkipSize.exchange(0)) {
         size_t n = strlen(buf);
-        snprintf(buf + n, size - n, ", last skipped %ux%u format %u", k >> 16, k & 0xffff, g_lastSkipFormat.load());
+        snprintf(buf + n, size - n, ", last refused image %ux%u format %u", k >> 16, k & 0xffff, g_lastSkipFormat.load());
     }
 }
 
@@ -932,23 +974,108 @@ uint32_t MirrorSize() {
     return best ? best->size : 0;
 }
 
-void* ResolveMirror(void* commandList, void* colorRes) {
+// The mirror's final image is reached through descriptors of the mod's own: a set per insertion
+// {t0 the resolved result, u0 the game's image, u1 the work copy}. u0 stays null until the list is
+// submitted, then gets the game's own descriptor if it checks out (MirrorBeforeExecute).
+ID3D12RootSignature* g_copyRootSig = nullptr;
+ID3D12PipelineState* g_copyPso = nullptr;
+ID3D12DescriptorHeap* g_copyHeap = nullptr;
+UINT g_copyInc = 0;
+constexpr UINT kCopySets = 32;   // far more than frames in flight
+std::atomic<UINT> g_copyNext{0};
+std::atomic<bool> g_copyReady{false};
+bool g_copyFailed = false;
+std::mutex g_copyMutex;   // the fix-ups and the init
+
+struct Fixup {
+    void* list;
+    UINT set;
+    uint64_t table;   // the game's descriptor table (GPU handle) and the image's offset in it
+    UINT offset;
+    UINT w, h;        // the mod's textures
+};
+std::vector<Fixup> g_fixups;
+std::atomic<uint32_t> g_numFixups{0};
+
+D3D12_CPU_DESCRIPTOR_HANDLE CopyCpu(UINT set, UINT i) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g_copyHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)(set * 3 + i) * g_copyInc;
+    return h;
+}
+
+void ImageUav(UINT set, ID3D12Resource* image) {   // null: nothing to read or write
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+    u.Format = kMirrorColorFormat;
+    u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_device->CreateUnorderedAccessView(image, nullptr, &u, CopyCpu(set, 1));
+}
+
+bool InitMirrorCopy() {
+    if (g_copyReady.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lock(g_copyMutex);
+    if (g_copyReady.load()) return true;
+    if (g_copyFailed || !g_device) return false;
+    // reading the game's RGBA16F image through a UAV needs typed UAV loads of that format
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+    HRESULT hr = g_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+    if (SUCCEEDED(hr) && !o.TypedUAVLoadAdditionalFormats) hr = E_NOTIMPL;
+    if (SUCCEEDED(hr)) hr = g_device->CreateRootSignature(0, kMirror_copyCso, sizeof(kMirror_copyCso), IID_PPV_ARGS(&g_copyRootSig));
+    if (SUCCEEDED(hr)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+        d.pRootSignature = g_copyRootSig;
+        d.CS = {kMirror_copyCso, sizeof(kMirror_copyCso)};
+        hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&g_copyPso));
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kCopySets * 3,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        hr = g_device->CreateDescriptorHeap(&h, IID_PPV_ARGS(&g_copyHeap));
+    }
+    if (FAILED(hr)) {
+        Log("hair: mirror copy init failed 0x%lx", hr);
+        g_copyFailed = true;
+        return false;
+    }
+    g_copyInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_copyReady.store(true, std::memory_order_release);
+    return true;
+}
+
+void UavBarrierAll(ID3D12GraphicsCommandList* cl) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // all UAV accesses (the game's image is not known here)
+    cl->ResourceBarrier(1, &b);
+}
+
+void MirrorAfterPass(void* commandList, uint64_t table, unsigned offset) {
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(commandList);
-    auto* color = static_cast<ID3D12Resource*>(colorRes);
-    if (!cl || !color || !IsActive() || !g_config.mirror || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return nullptr;
-    D3D12_RESOURCE_DESC cd = color->GetDesc();
-    const UINT w = (UINT)cd.Width, h = cd.Height;
-    const uint64_t frame = g_frameNo.load();
+    if (!cl) return;
     g_stats[kPasses]++;
-    // mirror passes without other views' hair while the main view gets hair: the learned main depth
-    // buffer is the mirror's - learn it again
-    if (g_otherDrawnFrame.load() + 2 < frame) {
-        if (++g_missed >= 30 && g_mainDsv.load() && g_mainDrawnFrame.load() + 1 >= frame) {
+    if (!IsActive() || !g_config.mirror) {
+        g_stats[kSkipOff]++;
+        return;
+    }
+    if (cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {   // the resolve needs a graphics list
+        g_stats[kSkipNotDirect]++;
+        return;
+    }
+    const uint64_t frame = g_frameNo.load();
+    g_mirrorPassFrame = frame;   // a mirror now (its pass, by its shader): keeps the main view's fallback away
+    // the mirror's hair goes to the other views' set; if none was drawn lately while the main view got
+    // hair, the learned main depth buffer is the mirror's - forget it
+    bool other = false;
+    {
+        std::lock_guard<std::mutex> lock(g_otherMutex);
+        for (const OtherDraw& o : g_otherDraws) other |= o.dsv && o.frame + 1 >= frame;
+    }
+    if (!other) {
+        if (g_mainDsv.load() && g_mainDrawnFrame.load() + 1 >= frame && ++g_missed >= 3) {
             Log("hair: main view depth buffer %p was a mirror's, forgotten", (void*)g_mainDsv.load());
             g_mainDsv = nullptr;
             g_missed = 0;
         }
-        return nullptr;   // nothing to resolve
+        g_stats[kSkipNoHair]++;
+        return;
     }
     g_missed = 0;
     Targets* t;
@@ -956,37 +1083,113 @@ void* ResolveMirror(void* commandList, void* colorRes) {
         std::lock_guard<std::mutex> lock(g_resMutex);
         t = g_other;
     }
-    // this frame's hair is in its top-left w x h on the GPU by now (drawn on a list submitted earlier)
-    auto skip = [&](Stat why) {
-        g_stats[why]++;
-        g_lastSkipSize = w << 16 | h;
-        g_lastSkipFormat = (uint32_t)cd.Format;
-        return nullptr;
-    };
-    // the mirror pass's shader also copies other textures: only the colour of a view whose hair was
-    // drawn this or the last frame, at exactly its size, in the mirror's format, is a mirror
-    bool drawn = false;
-    {
-        std::lock_guard<std::mutex> lock(g_otherMutex);
-        for (const OtherDraw& o : g_otherDraws)
-            drawn |= o.dsv && o.frame + 1 >= frame && o.size == (w << 16 | h);
+    if (!t || !t->work || t->needsInitialClear.load()) {
+        g_stats[kSkipSmall]++;
+        return;
     }
-    if (!drawn) return skip(kSkipSmall);
-    if (TypedFormat(cd.Format) != kMirrorColorFormat) return skip(kSkipFormat);
-    if (!t || t->w < w || t->h < h || t->needsInitialClear.load()) return skip(kSkipSmall);
-    if (!InitCompute()) return skip(kSkipOther);
-    if (g_mirrorSize.exchange(w << 16 | h) == 0) Log("hair: mirror %ux%u", w, h);
-    g_stats[kResolved]++;
-    const ViewSettings mirror = g_config.mirrorView;
-    RecordResolve(cl, t, color, cd, nullptr, DXGI_FORMAT_UNKNOWN, nullptr, DXGI_FORMAT_UNKNOWN, false, false, w, h, mirror);
-    // the unsharp mask at the mirror's resolution (also debug views 4 and 7)
-    UnsharpMaskMirror(cl, t->output, w, h, t->cov, t->areaValid ? t->tensor : nullptr, mirror);
-    // read: back to render targets for the next frame's mirror hair (cleared by its first draw)
+    if (!InitCompute() || !InitMirrorCopy()) {
+        g_stats[kSkipOther]++;
+        return;
+    }
+    const UINT w = t->w, h = t->h, set = g_copyNext.fetch_add(1) % kCopySets;
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = kMirrorColorFormat;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g_device->CreateShaderResourceView(t->output, &sd, CopyCpu(set, 0));
+        ImageUav(set, nullptr);   // until submission
+        D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+        u.Format = kMirrorColorFormat;
+        u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g_device->CreateUnorderedAccessView(t->work, nullptr, &u, CopyCpu(set, 2));
+        std::lock_guard<std::mutex> lock(g_copyMutex);
+        for (auto it = g_fixups.begin(); it != g_fixups.end();)   // a set reused: its old fix-up is gone
+            it = it->set == set ? g_fixups.erase(it) : it + 1;
+        g_fixups.push_back({cl, set, table, offset, w, h});
+        g_numFixups = (uint32_t)g_fixups.size();
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_copyHeap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (UINT64)set * 3 * g_copyInc;
+    auto copy = [&](uint32_t mode) {
+        const uint32_t c[4] = {mode, w, h, 0};
+        cl->SetDescriptorHeaps(1, &g_copyHeap);
+        cl->SetComputeRootSignature(g_copyRootSig);
+        cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+        cl->SetComputeRootDescriptorTable(1, gpu);
+        cl->SetPipelineState(g_copyPso);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    };
+
+    // the pass wrote the image (UAV): copy it, resolve the copy, write the result back - the image stays
+    // in the state the pass left it in; outside its size the work copy repeats its edge
     std::vector<D3D12_RESOURCE_BARRIER> bars;
+    UavBarrierAll(cl);
+    copy(0);
+    Barrier(cl, t->work, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, bars);
+    Flush(cl, bars);
+    const ViewSettings mirror = g_config.mirrorView;
+    D3D12_RESOURCE_DESC wd = t->work->GetDesc();
+    RecordResolve(cl, t, t->work, wd, nullptr, DXGI_FORMAT_UNKNOWN, nullptr, DXGI_FORMAT_UNKNOWN, false, false, w, h, mirror);
+    UnsharpMaskMirror(cl, t->output, w, h, t->cov, t->areaValid ? t->tensor : nullptr, mirror);
+    copy(1);   // t->output is readable (NON_PIXEL_SHADER_RESOURCE) after the resolve
+    UavBarrierAll(cl);
+    Barrier(cl, t->work, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, bars);
+    // read: back to render targets for the next frame's mirror hair
     Barrier(cl, t->cov, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
     Barrier(cl, t->kept, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, bars);
     Flush(cl, bars);
-    return t->output;   // NON_PIXEL_SHADER_RESOURCE; the result is its top-left w x h
+    g_stats[kResolved]++;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log("mirror: resolve recorded after the mirror's final pass (targets %ux%u)", w, h);
+    }
+}
+
+void MirrorBeforeExecute(unsigned n, void* const* lists) {
+    if (!g_numFixups.load(std::memory_order_relaxed) || !lists) return;
+    const uint64_t frame = g_frameNo.load();
+    std::lock_guard<std::mutex> lock(g_copyMutex);
+    for (auto it = g_fixups.begin(); it != g_fixups.end();) {
+        bool submitted = false;
+        for (unsigned i = 0; i < n && !submitted; ++i) submitted = lists[i] == it->list;
+        if (!submitted) {
+            ++it;
+            continue;
+        }
+        // the game's descriptor is final now: the image the pass wrote. Only the mirror's image is
+        // used: RGBA16F, no larger than the mod's textures, the size of hair drawn this or the last frame
+        DescInfo d;
+        const bool ok = DescAt(it->table, it->offset, &d) && d.uav && d.dim == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        d.fmt == kMirrorColorFormat && d.w <= it->w && d.h <= it->h && HairSizeRecent(d.w << 16 | d.h, frame);
+        if (ok) {
+            ImageUav(it->set, static_cast<ID3D12Resource*>(d.res));
+            g_mirrorSize = d.w << 16 | d.h;
+            g_stats[kApplied]++;
+        } else {
+            g_stats[kRejected]++;
+            g_lastSkipSize = d.w << 16 | d.h;
+            g_lastSkipFormat = d.fmt;
+        }
+        it = g_fixups.erase(it);
+    }
+    g_numFixups = (uint32_t)g_fixups.size();
+}
+
+void MirrorListReset(void* list) {
+    if (!g_numFixups.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_copyMutex);
+    for (auto it = g_fixups.begin(); it != g_fixups.end();) {
+        if (it->list == list) {
+            g_stats[kDropped]++;
+            it = g_fixups.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_numFixups = (uint32_t)g_fixups.size();
 }
 
 }  // namespace hf

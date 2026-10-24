@@ -47,7 +47,6 @@ bool PendingTargets(void** coverage, void** kept, void** resolved);
 void FinishUpscale(void* commandList);
 void OnHairFrameBoundary();
 uint64_t HairFrame();   // frames counted by OnHairFrameBoundary
-void NoteMirrorPass();  // the mirror's final pass runs (this frame has a mirror)
 void MirrorStats(char* buf, size_t size);   // counters since the last call, for the perf log
 
 // mirrors (a second view without upscaler; [Hair] Mirror): depth views tell a hair draw's view
@@ -55,10 +54,14 @@ void HairOnDepthView(void* resource, D3D12_CPU_DESCRIPTOR_HANDLE dst);
 // width << 16 | height of the view other than the main one whose hair was drawn last (this or the
 // last frame: a mirror's), else 0
 uint32_t MirrorSize();
-// the resolve of the mirror's hair into a copy of `color` (its lit colour, compute-readable, this
-// frame's mirror hair drawn): the result (NON_PIXEL_SHADER_RESOURCE, at least the colour's size: its
-// top-left part), or null
-void* ResolveMirror(void* commandList, void* color);
+// Right after the mirror's final pass on `commandList`: the hair resolve of its output image, the
+// descriptor `offset` of the shader-visible table `table` (a UAV). That descriptor may still change
+// until the list is submitted, so the image is reached through descriptors of the mod's own, written
+// at MirrorBeforeExecute; the recorded work touches the game's image only through them.
+void MirrorAfterPass(void* commandList, uint64_t table, unsigned offset);
+// command lists about to be submitted: their mirror descriptors, from the game's final ones
+void MirrorBeforeExecute(unsigned n, void* const* lists);
+void MirrorListReset(void* list);   // a list is reset: its pending mirror descriptors are dropped
 
 // unsharp mask on the upscaler output (usm.cpp)
 void ApplyUnsharpMask(void* commandList, void* output, unsigned ffxOutputState, unsigned renderW, unsigned renderH);

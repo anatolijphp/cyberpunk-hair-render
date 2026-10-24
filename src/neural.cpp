@@ -601,7 +601,7 @@ void PerfOnPresent() {
         frames / seconds, nR ? msR / nR : 0.0, nR, nM ? msM / nM : 0.0, nM, pm.PrivateUsage / 1048576.0, heaps, visible,
         replaced, created, bytes / 1048576.0);
     if (g_config.mirror) {
-        char a[320], b[160];
+        char a[420], b[200];
         MirrorStats(a, sizeof(a));
         MirrorPassStats(b, sizeof(b));
         Log("mirror: %s; %s", a, b);

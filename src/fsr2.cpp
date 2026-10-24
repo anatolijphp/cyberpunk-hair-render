@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -69,33 +70,72 @@ struct Bindings {
     UINT numHeaps = 0;
     ID3D12RootSignature* rootSig = nullptr;
     ID3D12PipelineState* pso = nullptr;
+    uint64_t psoHash = 0;    // its compute shader's hash (0: graphics / unknown)
     int pass = kOther;
     bool overflow = false;   // a root parameter index the tracking cannot hold
     Param params[kMaxParams];
+    ListGraphics gfx;
 };
 
-constexpr int kCached = 8;
-thread_local Bindings t_bind[kCached];
-thread_local int t_next = 0;
 thread_local bool t_injecting = false;   // our own commands go through the hooks too
 
+// every command list's bindings, in one table: a list may be recorded by different threads (one at a
+// time) over its life, so per-thread caches would see stale or missing state. Slots are never freed:
+// a list is (re)initialised on creation and Reset, also when a new list gets a freed one's address.
+constexpr size_t kListSlots = 2048;   // power of two
+struct ListSlot {
+    std::atomic<void*> list{nullptr};
+    Bindings b;
+};
+ListSlot g_listSlots[kListSlots];
+thread_local Bindings t_overflowSlot;   // the table is full: tracked here, never restorable
+
+size_t SlotHash(void* list) { return (size_t)(((uintptr_t)list >> 4) * 0x9E3779B97F4A7C15ull >> 53) & (kListSlots - 1); }
+
 Bindings* Find(void* list) {
-    for (auto& b : t_bind)
-        if (b.list == list) return &b;
+    if (!list) return nullptr;
+    const size_t h = SlotHash(list);
+    for (size_t i = 0; i < kListSlots; ++i) {
+        ListSlot& s = g_listSlots[(h + i) & (kListSlots - 1)];
+        void* l = s.list.load(std::memory_order_acquire);
+        if (l == list) return &s.b;
+        if (!l) return nullptr;
+    }
     return nullptr;
 }
 
-Bindings& Get(void* list) {
-    if (Bindings* b = Find(list)) return *b;
-    Bindings& b = t_bind[t_next++ % kCached];
+void ResetBindings(Bindings& b, void* list) {
     b.list = list;
     b.numHeaps = 0;
     b.rootSig = nullptr;
     b.pso = nullptr;
+    b.psoHash = 0;
     b.pass = kOther;
     b.overflow = false;
     for (auto& p : b.params) p.kind = kUnset;
-    return b;
+    b.gfx = ListGraphics{};
+}
+
+Bindings& Get(void* list) {
+    if (Bindings* b = Find(list)) return *b;
+    const size_t h = SlotHash(list);
+    for (size_t i = 0; i < kListSlots; ++i) {
+        ListSlot& s = g_listSlots[(h + i) & (kListSlots - 1)];
+        void* expected = nullptr;
+        if (s.list.compare_exchange_strong(expected, list, std::memory_order_acq_rel)) {
+            ResetBindings(s.b, list);
+            return s.b;
+        }
+        if (expected == list) return s.b;   // another thread inserted it (cannot happen while recording)
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log("fsr2: more than %zu command lists - bindings of further ones are not tracked", kListSlots);
+    }
+    ResetBindings(t_overflowSlot, list);
+    t_overflowSlot.overflow = true;   // never restorable
+    return t_overflowSlot;
 }
 
 Param* ParamOf(void* list, UINT index) {
@@ -165,17 +205,20 @@ struct Learned {
 };
 Learned g_learned[8];                       // colour textures (the game may alternate) and their state
 int g_learnedNext = 0;
-std::atomic<void*> g_mirrorWatch{nullptr};  // list whose barriers reveal the mirror colour's state
-ID3D12Resource* g_mirrorColor = nullptr;
-// the mirror's colour is a new texture every frame, always in the same state during the pass
-std::atomic<int> g_mirrorState{-1};
 
 // mirrors (hair.h): the mirror view's final compute pass reads its lit colour (an RGBA16F texture of
 // the view's size) and writes the image the mirror shows (another one). While the mirror's hair is
 // drawn, dispatches with those bindings are candidates; the one shader that is the only candidate in
 // a few frames is the pass, recognised by its hash from then on.
-std::mutex g_hashMutex;
-std::unordered_map<void*, uint64_t> g_csHashes;   // compute PSO -> shader hash (until the pass is known)
+std::shared_mutex g_hashMutex;
+std::unordered_map<void*, uint64_t> g_csHashes;   // compute PSO -> shader hash
+
+uint64_t HashOf(void* pso) {   // 0: not a compute PSO (or unknown)
+    if (!pso) return 0;
+    std::shared_lock<std::shared_mutex> lock(g_hashMutex);
+    auto it = g_csHashes.find(pso);
+    return it != g_csHashes.end() ? it->second : 0;
+}
 constexpr uint64_t kMirrorHash = 0xb06e565d137c14f4ull;   // the game's (2.x), found this way
 std::atomic<uint64_t> g_mirrorHash{kMirrorHash};
 constexpr int kMirrorFrames = 3;
@@ -304,12 +347,7 @@ void LearnMirror(const Bindings& b) {
         return d.w == w && d.h == h && d.fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
     };
     if (!fits(in) || !fits(out)) return;
-    uint64_t hash = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_hashMutex);
-        auto it = g_csHashes.find(b.pso);
-        if (it != g_csHashes.end()) hash = it->second;
-    }
+    const uint64_t hash = b.psoHash;
     if (!hash) return;
     std::lock_guard<std::mutex> lock(g_m);
     const uint64_t frame = HairFrame();
@@ -327,58 +365,79 @@ void LearnMirror(const Bindings& b) {
         if (g_candCount >= kMirrorFrames) {
             g_mirrorHash = g_candLast;
             Log("mirror: final pass found: shader %016llx, colour %ux%u", (unsigned long long)g_candLast, w, h);
-            std::lock_guard<std::mutex> hl(g_hashMutex);
+            std::shared_lock<std::shared_mutex> hl(g_hashMutex);
             for (const auto& e : g_csHashes)
                 if (e.second == g_candLast) AddPassPso(kMirror, e.first);
-            g_csHashes.clear();
             return;
         }
     }
     g_cands.insert(hash);
 }
 
-std::atomic<uint32_t> g_mirrorPassCalls{0}, g_mirrorStateWaits{0};
+std::atomic<uint32_t> g_mirrorPassCalls{0}, g_mirrorNoLayout{0};
 
-// before the mirror's final pass: the hair resolve of its input, copied over it
-void MirrorBeforeDispatch(ID3D12GraphicsCommandList* cl, const Bindings& b) {
+// where a root signature's first UAV sits: root parameter (a descriptor table) and descriptor offset
+// in it - the mirror pass's output image (from the root signature itself: valid while recording)
+struct UavLocation {
+    bool known = false, found = false;
+    UINT param = 0, offset = 0;
+};
+std::mutex g_layoutMutex;
+std::unordered_map<void*, UavLocation> g_layouts;
+
+UavLocation FirstUavLocation(ID3D12RootSignature* rootSig) {
+    {
+        std::lock_guard<std::mutex> lock(g_layoutMutex);
+        auto it = g_layouts.find(rootSig);
+        if (it != g_layouts.end()) return it->second;
+    }
+    UavLocation loc;
+    loc.known = true;
+    std::vector<uint8_t> blob;
+    using PFN_Deserializer = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
+    static auto create = reinterpret_cast<PFN_Deserializer>(
+        GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12CreateVersionedRootSignatureDeserializer"));
+    ID3D12VersionedRootSignatureDeserializer* des = nullptr;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+    if (rootSig && RootSignatureBlob(rootSig, &blob) && create &&
+        SUCCEEDED(create(blob.data(), blob.size(), IID_PPV_ARGS(&des))) && des &&
+        SUCCEEDED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
+        const D3D12_ROOT_SIGNATURE_DESC1& d = desc->Desc_1_1;
+        for (UINT i = 0; i < d.NumParameters && !loc.found; ++i) {
+            const D3D12_ROOT_PARAMETER1& p = d.pParameters[i];
+            if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+            UINT next = 0;
+            for (UINT r = 0; r < p.DescriptorTable.NumDescriptorRanges; ++r) {
+                const D3D12_DESCRIPTOR_RANGE1& range = p.DescriptorTable.pDescriptorRanges[r];
+                UINT offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                  ? next : range.OffsetInDescriptorsFromTableStart;
+                if (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
+                    loc.found = true;
+                    loc.param = i;
+                    loc.offset = offset;
+                    break;
+                }
+                next = offset + range.NumDescriptors;
+            }
+        }
+    }
+    if (des) des->Release();
+    Log("mirror: final pass root signature %p: output %s (parameter %u, descriptor %u)", (void*)rootSig,
+        loc.found ? "found" : "not found", loc.param, loc.offset);
+    std::lock_guard<std::mutex> lock(g_layoutMutex);
+    g_layouts[rootSig] = loc;
+    return loc;
+}
+
+// right after the mirror's final pass: the resolve of its output (hair.cpp)
+void MirrorAfterDispatch(ID3D12GraphicsCommandList* cl, const Bindings& b) {
     g_mirrorPassCalls++;
-    NoteMirrorPass();
-    DescInfo info, out;
-    ID3D12Resource* color = FirstTexture(b, false, &info);
-    if (!color) {
-        LogOnce("mirror: colour not found in the final pass bindings");
+    const UavLocation loc = FirstUavLocation(b.rootSig);
+    if (!loc.found || loc.param >= kMaxParams || b.params[loc.param].kind != kTable) {
+        g_mirrorNoLayout++;
         return;
     }
-    // the shader also copies other textures: the mirror's pass writes one RGBA16F image of its size
-    if (!FirstTexture(b, true, &out) || out.res == color || out.w != info.w || out.h != info.h ||
-        out.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT || info.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
-        return;
-    const int learned = g_mirrorState.load();
-    if (learned < 0) {   // learned from the game's next barrier of it
-        g_mirrorStateWaits++;
-        std::lock_guard<std::mutex> lock(g_m);
-        g_mirrorColor = color;
-        g_mirrorWatch = cl;
-        return;
-    }
-    const auto state = (D3D12_RESOURCE_STATES)learned;
-    auto* result = static_cast<ID3D12Resource*>(ResolveMirror(cl, color));
-    if (!result) return;
-    std::vector<D3D12_RESOURCE_BARRIER> bars;
-    Transition(bars, color, state, D3D12_RESOURCE_STATE_COPY_DEST);
-    Transition(bars, result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    cl->ResourceBarrier((UINT)bars.size(), bars.data());
-    D3D12_TEXTURE_COPY_LOCATION dst{color, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}}, src{result, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    dst.SubresourceIndex = src.SubresourceIndex = 0;
-    const D3D12_BOX box{0, 0, 0, info.w, info.h, 1};   // the result's top-left part: the colour's size
-    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    for (auto& br : bars) std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
-    cl->ResourceBarrier((UINT)bars.size(), bars.data());
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        Log("mirror: hair resolved into the mirror's colour %p (%ux%u, state 0x%x)", (void*)color, info.w, info.h, state);
-    }
+    MirrorAfterPass(cl, b.params[loc.param].value, loc.offset);
 }
 
 // the first transition of `color` in a watched list leaves the state the pass read it in (g_m held)
@@ -405,15 +464,15 @@ bool LearnState(ID3D12Resource*& color, UINT n, const D3D12_RESOURCE_BARRIER* ba
 }  // namespace
 
 void MirrorPassStats(char* buf, size_t size) {
-    snprintf(buf, size, "mirror shader %016llx, pass dispatches %u, state waits %u",
-             (unsigned long long)g_mirrorHash.load(), g_mirrorPassCalls.exchange(0), g_mirrorStateWaits.exchange(0));
+    snprintf(buf, size, "mirror shader %016llx, pass dispatches %u, no output in its root signature %u",
+             (unsigned long long)g_mirrorHash.load(), g_mirrorPassCalls.exchange(0), g_mirrorNoLayout.exchange(0));
 }
 
 void Fsr2PsoCreated(void* pso, uint64_t csHash) {
     if (!pso) return;
     const uint64_t mirror = g_mirrorHash.load();
-    if (!HavePass(kMirror)) {   // hashes for learning the mirror's pass
-        std::lock_guard<std::mutex> lock(g_hashMutex);
+    {   // every compute PSO's shader hash (for recognising the mirror pass at its dispatch)
+        std::unique_lock<std::shared_mutex> lock(g_hashMutex);
         if (csHash) g_csHashes[pso] = csHash;
         else g_csHashes.erase(pso);   // a graphics PSO at a freed compute PSO's address
     }
@@ -442,17 +501,22 @@ void TrackComputeRootSignature(void* list, ID3D12RootSignature* rootSig) {
 
 void TrackListReset(void* list, ID3D12PipelineState* pso) {
     Bindings& b = Get(list);
-    b.numHeaps = 0;
-    b.rootSig = nullptr;
-    b.overflow = false;
-    for (auto& p : b.params) p.kind = kUnset;
+    ResetBindings(b, list);
     b.pso = pso;
+    b.psoHash = HashOf(pso);
     b.pass = PassOf(pso);
+}
+
+ListGraphics* GraphicsOf(void* list, bool create) {
+    if (create) return &Get(list).gfx;
+    Bindings* b = Find(list);
+    return b ? &b->gfx : nullptr;
 }
 
 void TrackPipelineState(void* list, ID3D12PipelineState* pso) {
     Bindings& b = Get(list);
     b.pso = pso;
+    b.psoHash = HashOf(pso);
     b.pass = PassOf(pso);
 }
 
@@ -490,20 +554,13 @@ void Fsr2BeforeDispatch(void* list) {
     if (t_injecting) return;
     Bindings* b = Find(list);
     int pass = b ? b->pass : kOther;
-    if (pass == kOther && b) LearnMirror(*b);
-    if (pass == kMirror) {
-        if (!Restorable(*b)) {
-            LogOnce("mirror: game bindings not restorable - mirror left alone");
-            return;
-        }
-        auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
-        Bindings saved = *b;
-        t_injecting = true;
-        MirrorBeforeDispatch(cl, saved);
-        Restore(cl, saved);
-        t_injecting = false;
-        return;
+    // the mirror's final pass by the bound shader itself; if its hash is unknown (a patch), learned
+    // while other views' hair is drawn
+    if (b && pass == kOther) {
+        if (b->psoHash && b->psoHash == g_mirrorHash.load(std::memory_order_relaxed)) return;   // after it
+        if (MirrorSize()) LearnMirror(*b);
     }
+    if (pass == kMirror) return;   // the work goes after the dispatch
     bool pending = g_pendingList.load(std::memory_order_relaxed) == list;
     if (pass != kLuminance && !(pending && pass != kRcas)) return;
     if (!b || !Restorable(*b)) {
@@ -549,6 +606,19 @@ ID3D12Resource* FinalOutput(const Bindings& b) {
 void Fsr2AfterDispatch(void* list) {
     if (t_injecting) return;
     Bindings* b = Find(list);
+    if (b && (b->pass == kMirror || (b->psoHash && b->psoHash == g_mirrorHash.load(std::memory_order_relaxed)))) {
+        if (!Restorable(*b)) {
+            LogOnce("mirror: game bindings not restorable - mirror left alone");
+            return;
+        }
+        auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
+        Bindings saved = *b;
+        t_injecting = true;
+        MirrorAfterDispatch(cl, saved);
+        Restore(cl, saved);
+        t_injecting = false;
+        return;
+    }
     if (!b || (b->pass != kAccumulate && b->pass != kAccumulateFinal && b->pass != kRcas)) return;
     DescInfo info;
     ID3D12Resource* out = b->pass == kAccumulateFinal ? FinalOutput(*b) : FirstTexture(*b, true, &info);
@@ -573,20 +643,10 @@ void Fsr2AfterDispatch(void* list) {
 
 void Fsr2OnBarriers(void* list, UINT n, const D3D12_RESOURCE_BARRIER* barriers) {
     if (t_injecting || !barriers) return;
-    const bool fsr = g_watchList.load(std::memory_order_relaxed) == list;
-    const bool mirror = g_mirrorWatch.load(std::memory_order_relaxed) == list;
-    if (!fsr && !mirror) return;
+    if (g_watchList.load(std::memory_order_relaxed) != list) return;
     std::lock_guard<std::mutex> lock(g_m);
     // the first transition of the colour after the luminance pass leaves the state FSR read it in
-    if (fsr && LearnState(g_color, n, barriers, "fsr2: input colour")) g_watchList = nullptr;
-    if (mirror) {
-        ID3D12Resource* color = g_mirrorColor;
-        if (LearnState(g_mirrorColor, n, barriers, "mirror: colour")) {
-            D3D12_RESOURCE_STATES s;
-            if (StateOf(color, &s)) g_mirrorState = (int)s;
-            g_mirrorWatch = nullptr;
-        }
-    }
+    if (LearnState(g_color, n, barriers, "fsr2: input colour")) g_watchList = nullptr;
 }
 
 void Fsr2BeforeClose(void* list) {

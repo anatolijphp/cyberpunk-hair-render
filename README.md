@@ -139,10 +139,12 @@ gets sharper, more strand-like hair to work with. It changes hair pixels only.
 - FSR 2.1: the log says `fsr2: built-in FSR 2.1 found` once the fix is active. If that line never
   appears, the game's FSR 2.1 shaders changed: set `[Debug] ProbeUpscaler = true`, play for a minute
   with FSR 2.1 selected and report the log.
-- Mirrors: the log says `hair: mirror <size>` once a mirror's hair is resolved, and every 10 seconds
-  a `mirror:` line counts the hair draws per view and the mirror passes resolved or skipped. After a
-  game patch that changes the mirror's final pass, the mod looks for it by its inputs and logs
-  `mirror: final pass found` when it has it again.
+- Mirrors: the log says `mirror: resolve recorded after the mirror's final pass` once a mirror's
+  hair is resolved, and every 10 seconds a `mirror:` line counts the hair draws per view, the mirror
+  passes recorded or skipped, and at submission how many found the mirror's image (`image found`)
+  or were left alone (`not the mirror's`, `list reset`). After a game patch that changes the
+  mirror's final pass, the mod looks for it by its inputs and logs `mirror: final pass found` when
+  it has it again.
 - Crash or black screen: set `Enabled = false`, or uninstall, and report the log.
 
 ## How it works
@@ -189,12 +191,18 @@ through the same three passes, so the mod's coverage pass sees it too. The mod (
 - recognises the mirror view's final compute pass (it turns the mirror's lit colour into the image the
   mirror shows) by its shader hash, or, after a patch, by its bindings: one RGBA16F texture of the
   mirror's size read, one written;
-- inserts the resolve (and the network, the area passes and the unsharp mask, with the `[Mirror]`
-  settings) before that pass, the same way as for FSR 2.1, and copies the result over its input.
+- inserts its work right after that pass, on copies of its own: the pass's output is copied, the
+  copy resolved (with the network, the area passes and the unsharp mask, using the `[Mirror]`
+  settings) and the result written back.
 
-The mirror's hair and its final pass are recorded on different command lists, in parallel. Nothing
-depends on their recording order: on the GPU the hair is drawn first, then the mirror pass reads it,
-and the coverage targets are cleared after the main view's upscale.
+The mirror's hair and its final pass are recorded on different command lists, in parallel, and the
+mirror's textures are new every frame. While a list is being recorded, the descriptor of the pass's
+output may still point at an older texture: the game may write it later, before it submits the
+list. So the mod reaches the mirror's image only through a descriptor of its own, filled from the
+game's final descriptor in `ExecuteCommandLists`, and only if it is the mirror's image (RGBA16F, the
+size of the mirror's hair); otherwise the copies do nothing and the mirror is left as the game drew
+it. On the GPU the hair is drawn first, then the mirror pass, then the mod's work; the coverage
+targets are cleared after the main view's upscale.
 
 ## Building
 

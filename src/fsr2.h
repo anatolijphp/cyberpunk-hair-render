@@ -12,6 +12,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace hf {
 
@@ -23,6 +24,22 @@ void TrackDescriptorHeaps(void* list, UINT n, ID3D12DescriptorHeap* const* heaps
 void TrackComputeRootSignature(void* list, ID3D12RootSignature* rootSig);
 void TrackPipelineState(void* list, ID3D12PipelineState* pso);
 void TrackListReset(void* list, ID3D12PipelineState* pso);   // Reset / creation: nothing bound but pso
+
+// graphics state of a command list, kept with its compute bindings (a list may be recorded by different
+// threads over its life, one at a time)
+struct ListGraphics {
+    ID3D12PipelineState* pso = nullptr;
+    int hairKind = 0;   // 1: a hair alpha_accum PSO is bound, 2: a hair gbuffer_solid PSO
+    UINT rtCount = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE rts[8]{};
+    BOOL rtSingle = FALSE;
+    bool hasDsv = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+    bool inPass = false;   // inside a D3D12 render pass
+};
+ListGraphics* GraphicsOf(void* list, bool create);   // null: not tracked (create = false)
+
+bool RootSignatureBlob(void* rootSig, std::vector<uint8_t>* blob);   // hooks.cpp
 void TrackComputeTable(void* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table);
 void TrackComputeConstants(void* list, UINT index, UINT n, const void* data, UINT offset);
 void TrackComputeRootView(void* list, UINT index, int kind, D3D12_GPU_VIRTUAL_ADDRESS va);   // 3 CBV, 4 SRV, 5 UAV

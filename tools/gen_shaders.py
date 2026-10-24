@@ -20,7 +20,8 @@ VARIANTS = [
 ]
 SHARPEN_THRESHOLDS = [0.2, 0.3, 0.4, 0.5]
 SHARPEN_WIDTHS = [1.0, 1.5, 2.0, 3.0]
-COMPUTE = ["banner", "resolve", "resolve_tensor", "area_h", "area", "usm", "nn_bbox", "nn_prep", "nn_conv", "nn_pool", "nn_apply"]
+COMPUTE = ["banner", "resolve", "resolve_tensor", "area_h", "area", "usm", "nn_bbox", "nn_prep", "nn_conv", "nn_pool", "nn_apply",
+           "mirror_copy"]
 # 16-bit math variants: (output name, source, profile, extra dxc arguments)
 COMPUTE16 = [("nn_conv16", "nn_conv", "cs_6_4", ["-enable-16bit-types", "-D", "HALF=1"])]
 GRAPHICS = [("imgui_vs", "vs_6_0"), ("imgui_ps", "ps_6_0")]   # overlay UI
