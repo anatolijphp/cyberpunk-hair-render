@@ -22,6 +22,9 @@ would render without the dither, and FSR then rebuilds detail from these sharp j
 The shipped model: 12 channels, 53,571 weights, trained on 32 views of one character
 (4 photo mode scenes × 8 rotations) at 853×480 → 2560×1440 (FSR 3 Ultra Performance). On the
 held-out scene it scores 23.7 dB hair PSNR against Native AA. The plain strand resolve scores 22.5 dB.
+It was trained on captures from v0.3.0, which stored the hair coverage in 8 bits. Captures from
+v0.3.1 on hold 16-bit coverage. Old captures can't be converted, but `prepare.py` and `train.py`
+read both, so old and new scenes can be trained together.
 
 ## Requirements
 

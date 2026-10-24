@@ -103,6 +103,10 @@ gets sharper, more strand-like hair to work with. It changes hair pixels only.
   2560×1440). It works at other qualities and with FSR 2.1, but other hairstyles and resolutions
   weren't in its training data. `training/README.md` explains how to capture your own data and
   retrain it.
+- The shipped model was trained with v0.3.0, which stored the hair coverage in 8 bits. Since
+  v0.3.1 the coverage is 16-bit, so faint strands no longer drop out of it. The model works
+  unchanged with that (only thin strands look a little denser to it), but a model retrained
+  on captures from v0.3.1 or later would match the new coverage exactly.
 
 ## Troubleshooting
 
